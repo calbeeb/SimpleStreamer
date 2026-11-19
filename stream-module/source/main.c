@@ -6,7 +6,7 @@
 #include "stream.h"
 
 u32 __nx_applet_type = AppletType_None;
-size_t __nx_heap_size = 0x1400000; // 20 MB heap
+size_t __nx_heap_size = 0x2000000;
 
 void __appInit(void) {}
 void __appExit(void) {}
@@ -28,6 +28,8 @@ static Result pluginCommand(u32 command_id, const void* input,
             .last_frame_size   = atomic_load(&ctx->last_frame_size),
             .client_connected  = atomic_load(&ctx->client_connected) ? 1 : 0,
             .stream_port       = STREAM_PORT,
+            .net_listening     = atomic_load(&ctx->net_listening) ? 1 : 0,
+            .reserved          = 0,
         };
         memcpy(output, &st, sizeof(st));
         *output_size = sizeof(st);
@@ -53,7 +55,7 @@ static Result pluginCommand(u32 command_id, const void* input,
         bool cur = atomic_load(&ctx->streaming_enabled);
         atomic_store(&ctx->streaming_enabled, !cur);
         mutexLock(&ctx->buf_mutex);
-        condvarBroadcast(&ctx->frame_cv);
+        condvarWakeAll(&ctx->frame_cv);
         mutexUnlock(&ctx->buf_mutex);
         *output_size = 0;
         return 0;
@@ -70,12 +72,28 @@ int main(void) {
 
     bool fs_inited = R_SUCCEEDED(fsInitialize());
     bool sd_mounted = fs_inited && R_SUCCEEDED(fsdevMountSdmc());
-    bool sock_inited = R_SUCCEEDED(socketInitializeDefault());
+
+    static const SocketInitConfig sock_cfg = {
+        .tcp_tx_buf_size     = 0x20000,  // 128 KB TX socket buffer
+        .tcp_rx_buf_size     = 0x10000,  // 64 KB RX socket buffer
+        .tcp_tx_buf_max_size = 0x100000, // 1 MB max TX TransferMemory pool
+        .tcp_rx_buf_max_size = 0x40000,  // 256 KB max RX TransferMemory pool
+        .udp_tx_buf_size     = 0x2400,
+        .udp_rx_buf_size     = 0xA500,
+        .sb_efficiency       = 4,
+        .num_bsd_sessions    = 3,
+        .bsd_service_type    = BsdServiceType_User,
+    };
+    Result sock_rc = socketInitialize(&sock_cfg);
+    if (R_FAILED(sock_rc)) {
+        sock_rc = socketInitializeDefault();
+    }
+    bool sock_inited = R_SUCCEEDED(sock_rc);
 
     if (sd_mounted) {
         FILE* f = fopen("sdmc:/kaihen_caps2s.log", "w");
         if (f) {
-            fprintf(f, "stream-module initialized (fs=%d, sd=%d, sock=%d)\n", fs_inited, sd_mounted, sock_inited);
+            fprintf(f, "stream-module started (fs=%d, sd=%d, sock_rc=0x%x)\n", fs_inited, sd_mounted, sock_rc);
             fclose(f);
         }
     }
@@ -88,24 +106,25 @@ int main(void) {
     atomic_init(&ctx.running, false);
     atomic_init(&ctx.streaming_enabled, true);
     atomic_init(&ctx.client_connected, false);
+    atomic_init(&ctx.net_listening, false);
     atomic_init(&ctx.last_rc, 0);
     atomic_init(&ctx.avg_fps_x100, 0);
     atomic_init(&ctx.frames_captured, 0);
     atomic_init(&ctx.last_frame_size, 0);
 
-    ctx.work_buf = (u8*)aligned_alloc(0x1000, CAP_BUF_SIZE);
-    ctx.snap_buf = (u8*)aligned_alloc(0x1000, CAP_BUF_SIZE);
-    ctx.net_buf  = (u8*)aligned_alloc(0x1000, CAP_BUF_SIZE);
+    // Three isolated 4 MB buffers:
+    // - cap_buf:   used exclusively by capture_thread (caps2:s IPC)
+    // - stage_buf: protected by buf_mutex (CPU memcpy staging only, never passed to IPC)
+    // - net_buf:   used exclusively by network_thread (bsdSend IPC)
+    ctx.cap_buf   = (u8*)aligned_alloc(0x1000, CAP_BUF_SIZE);
+    ctx.stage_buf = (u8*)aligned_alloc(0x1000, CAP_BUF_SIZE);
+    ctx.net_buf   = (u8*)aligned_alloc(0x1000, CAP_BUF_SIZE);
 
     Handle exit_write = INVALID_HANDLE;
     Handle exit_read = INVALID_HANDLE;
     PluginService service = {0};
-    Thread cap_thread = {0};
-    Thread net_thread = {0};
-    bool cap_ok = false;
-    bool net_ok = false;
 
-    if (!ctx.work_buf || !ctx.snap_buf || !ctx.net_buf) {
+    if (!ctx.cap_buf || !ctx.stage_buf || !ctx.net_buf) {
         rc = MAKERESULT(Module_Libnx, LibnxError_OutOfMemory);
     } else {
         rc = svcCreateEvent(&exit_write, &exit_read);
@@ -116,6 +135,11 @@ int main(void) {
         rc = pluginServiceStart(&service, control_session, pluginCommand, &ctx);
     }
 
+    Thread cap_thread = {0};
+    Thread net_thread = {0};
+    bool cap_ok = false;
+    bool net_ok = false;
+
     if (R_SUCCEEDED(rc) && R_SUCCEEDED(threadCreate(&cap_thread, capture_thread_func, &ctx, NULL, 0x10000, 0x2C, -2))) {
         cap_ok = R_SUCCEEDED(threadStart(&cap_thread));
     }
@@ -124,8 +148,13 @@ int main(void) {
         net_ok = R_SUCCEEDED(threadStart(&net_thread));
     }
 
-    if (R_SUCCEEDED(rc)) rc = svcSignalEvent(ready);
-    if (R_SUCCEEDED(rc)) rc = svcWaitSynchronizationSingle(exit_read, UINT64_MAX);
+    if (R_SUCCEEDED(rc)) {
+        rc = svcSignalEvent(ready);
+    }
+
+    if (R_SUCCEEDED(rc)) {
+        rc = svcWaitSynchronizationSingle(exit_read, UINT64_MAX);
+    }
 
     atomic_store(&ctx.stop_requested, true);
     if (ctx.listen_fd >= 0) {
@@ -139,8 +168,9 @@ int main(void) {
 
     if (exit_read != INVALID_HANDLE) svcCloseHandle(exit_read);
     if (exit_write != INVALID_HANDLE) svcCloseHandle(exit_write);
-    free(ctx.work_buf);
-    free(ctx.snap_buf);
+
+    free(ctx.cap_buf);
+    free(ctx.stage_buf);
     free(ctx.net_buf);
 
     if (sock_inited) socketExit();

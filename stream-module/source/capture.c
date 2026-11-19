@@ -36,17 +36,30 @@ void capture_thread_func(void* arg) {
         u64 out_size = 0;
         rc = serviceDispatchInOut(&caps2sSrv, 101, mode, out_size,
             .buffer_attrs = { SfBufferAttr_HipcAutoSelect | SfBufferAttr_Out | SfBufferAttr_HipcMapTransferAllowsNonSecure },
-            .buffers = { { ctx->work_buf, CAP_BUF_SIZE } },
+            .buffers = { { ctx->cap_buf, CAP_BUF_SIZE } },
         );
 
         atomic_store(&ctx->last_rc, rc);
 
+        if (rc == 0x104110) {
+            // Resolution mismatch (Docked 1080p vs Handheld 720p): toggle mode
+            mode = (mode == CAPS2S_MODE_1080P_JPEG) ? CAPS2S_MODE_720P_JPEG : CAPS2S_MODE_1080P_JPEG;
+            svcSleepThread(50000000ULL); // 50 ms pause
+            continue;
+        }
+
+        if (rc == 0x10d310) {
+            // Layer transition / HOME menu / no active layer: sleep 50ms and wait for layer
+            svcSleepThread(50000000ULL);
+            continue;
+        }
+
         if (R_SUCCEEDED(rc) && out_size > 0 && out_size <= CAP_BUF_SIZE) {
             mutexLock(&ctx->buf_mutex);
-            memcpy(ctx->snap_buf, ctx->work_buf, out_size);
-            ctx->snap_size = out_size;
+            memcpy(ctx->stage_buf, ctx->cap_buf, out_size);
+            ctx->stage_size = out_size;
             ctx->frame_seq++;
-            condvarBroadcast(&ctx->frame_cv);
+            condvarWakeAll(&ctx->frame_cv);
             mutexUnlock(&ctx->buf_mutex);
 
             atomic_fetch_add(&ctx->frames_captured, 1);
@@ -62,12 +75,22 @@ void capture_thread_func(void* arg) {
                 window_start_tick = now_tick;
             }
         } else {
-            svcSleepThread(16000000ULL);
+            // Log any unexpected error code once
+            static Result last_logged_err = 0;
+            if (rc != last_logged_err) {
+                last_logged_err = rc;
+                char err_buf[64];
+                snprintf(err_buf, sizeof(err_buf), "caps2:s Cmd 101 error: 0x%x", rc);
+                stream_write_log(err_buf);
+            }
+            // When capture fails (e.g. HOME menu open / layer transition), back off 100ms
+            // to avoid hammering capsrv2 and prevent abort panics (2168-0002)
+            svcSleepThread(100000000ULL);
         }
     }
 
     mutexLock(&ctx->buf_mutex);
-    condvarBroadcast(&ctx->frame_cv);
+    condvarWakeAll(&ctx->frame_cv);
     mutexUnlock(&ctx->buf_mutex);
 
     atomic_store(&ctx->running, false);
@@ -78,12 +101,12 @@ void capture_thread_func(void* arg) {
 Result capture_save_latest_frame(CaptureContext* ctx, const char* path) {
     Result save_rc = MAKERESULT(Module_Libnx, LibnxError_NotFound);
     mutexLock(&ctx->buf_mutex);
-    if (ctx->snap_size > 0 && ctx->snap_size <= CAP_BUF_SIZE) {
+    if (ctx->stage_size > 0 && ctx->stage_size <= CAP_BUF_SIZE) {
         FILE* f = fopen(path, "wb");
         if (f) {
-            size_t written = fwrite(ctx->snap_buf, 1, ctx->snap_size, f);
+            size_t written = fwrite(ctx->stage_buf, 1, ctx->stage_size, f);
             fclose(f);
-            if (written == ctx->snap_size) {
+            if (written == ctx->stage_size) {
                 save_rc = 0;
             }
         }

@@ -53,3 +53,13 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+# pycache
+__pycache__/
+
+# built homebrew apps/plugins
+*.nro
+*.nso
+
+# service probing
+.probes/
