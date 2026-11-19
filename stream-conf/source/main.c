@@ -1,41 +1,9 @@
 // SPDX-License-Identifier: MIT
-// Companion config and telemetry .nro for stream-module.nso on Switch 2.
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <switch.h>
-#include <kaihen.h>
-
-typedef struct {
-    u32 running;
-    u32 avg_fps_x100;
-    Result last_rc;
-    u32 pad;
-    u64 frames_captured;
-    u64 last_frame_size;
-} Caps2sStatus;
-
-static Result open_kaihen_plugin(Service* out_plugin, const char* plugin_name) {
-    Service ro = {0};
-    Result rc = kaihenGetRoSession(&ro);
-    if (R_FAILED(rc)) {
-        return rc;
-    }
-
-    Service hen = {0};
-    rc = kaihenOpenHomebrewSession(&ro, &hen);
-    if (R_FAILED(rc)) {
-        return rc;
-    }
-
-    HenPluginName req = {0};
-    strncpy(req.name, plugin_name, sizeof(req.name) - 1);
-
-    rc = henOpenPlugin(&hen, &req, out_plugin);
-    serviceClose(&hen);
-    return rc;
-}
+#include "config.h"
 
 int main(int argc, char* argv[]) {
     (void)argc;
@@ -47,15 +15,18 @@ int main(int argc, char* argv[]) {
     PadState pad;
     padInitializeDefault(&pad);
 
+    char ipStr;
+    config_get_ip_str(ipStr, sizeof(ipStr));
+
     const char* plugin_name = "stream-module";
     Service pluginSrv = {0};
     bool connected = false;
-    Result openRc = open_kaihen_plugin(&pluginSrv, plugin_name);
+    Result openRc = config_open_plugin(&pluginSrv, plugin_name);
     if (R_SUCCEEDED(openRc)) {
         connected = true;
     }
 
-    char statusMsg[128] = "Ready.";
+    char statusMsg = "Ready.";
     if (!connected) {
         snprintf(statusMsg, sizeof(statusMsg), "Failed to open %s: 0x%x", plugin_name, openRc);
     }
@@ -71,13 +42,23 @@ int main(int argc, char* argv[]) {
             break;
         }
 
-        // [A] Save latest captured 1080p JPEG frame to SD card (Cmd 1)
+        // [A] Save latest frame to SD card (Cmd 1)
         if ((kDown & HidNpadButton_A) && connected) {
             Result saveRc = serviceDispatch(&pluginSrv, 1);
             if (R_SUCCEEDED(saveRc)) {
                 snprintf(statusMsg, sizeof(statusMsg), "Saved sdmc:/kaihen_caps2s_frame.jpg!");
             } else {
                 snprintf(statusMsg, sizeof(statusMsg), "Save failed: 0x%x", saveRc);
+            }
+        }
+
+        // [B] Toggle network streaming on/off (Cmd 3)
+        if ((kDown & HidNpadButton_B) && connected) {
+            Result togRc = serviceDispatch(&pluginSrv, 3);
+            if (R_SUCCEEDED(togRc)) {
+                snprintf(statusMsg, sizeof(statusMsg), "Toggled network streaming.");
+            } else {
+                snprintf(statusMsg, sizeof(statusMsg), "Toggle failed: 0x%x", togRc);
             }
         }
 
@@ -93,7 +74,7 @@ int main(int argc, char* argv[]) {
 
         // [Y] Reconnect to background plugin
         if ((kDown & HidNpadButton_Y) && !connected) {
-            openRc = open_kaihen_plugin(&pluginSrv, plugin_name);
+            openRc = config_open_plugin(&pluginSrv, plugin_name);
             if (R_SUCCEEDED(openRc)) {
                 connected = true;
                 snprintf(statusMsg, sizeof(statusMsg), "Reconnected to %s!", plugin_name);
@@ -114,7 +95,7 @@ int main(int argc, char* argv[]) {
 
         // Render UI
         consoleClear();
-        printf("=== Switch 2 caps2:s Capture Config ===\n\n");
+        printf("=== Switch 2 Live MJPEG Streamer ===\n\n");
         printf("Plugin IPC:  %s (open_rc: 0x%x)\n", connected ? "CONNECTED" : "DISCONNECTED", openRc);
 
         if (connected) {
@@ -122,15 +103,20 @@ int main(int argc, char* argv[]) {
             printf("Live Speed:  %.2f FPS\n", (double)st.avg_fps_x100 / 100.0);
             printf("Frames:      %lu\n", st.frames_captured);
             printf("Frame Size:  %lu bytes (%.1f KB)\n", st.last_frame_size, (double)st.last_frame_size / 1024.0);
+            printf("\nStream URL:  http://%s:%u/stream.mjpg\n", ipStr, st.stream_port ? st.stream_port : 8080);
+            printf("Net Stream:  %s | Viewer: %s\n",
+                   st.streaming_enabled ? "ENABLED" : "PAUSED",
+                   st.client_connected ? "PC CONNECTED" : "WAITING FOR PC");
         }
 
         printf("\n---------------------------------------\n");
         printf("Last Action: %s\n", statusMsg);
         printf("---------------------------------------\n\n");
         printf("[A] Save Frame to SD (sdmc:/kaihen_caps2s_frame.jpg)\n");
-        printf("[X] Stop Background Capture Plugin\n");
+        printf("[B] Toggle Network Stream ON/OFF\n");
+        printf("[X] Stop Background Plugin\n");
         printf("[Y] Reconnect to Plugin\n");
-        printf("[+] Exit Config (keeps background capture running)\n");
+        printf("[+] Exit Config (keeps background stream running)\n");
 
         consoleUpdate(NULL);
     }
