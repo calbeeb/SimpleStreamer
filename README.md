@@ -1,4 +1,4 @@
-# Simple Streamer
+# SimpleStreamer
 
 ## About
 ### Requires a stable & strong network connection, bitrates can exceed *250* Mbps
