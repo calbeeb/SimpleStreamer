@@ -4,32 +4,39 @@ import subprocess
 import sys
 import time
 
-SWITCH_IP = sys.argv[1] if len(sys.argv) > 1 else "192.168.8.205"
+if len(sys.argv) > 1:
+    SWITCH_IP = sys.argv[1]
+else:
+    raise ValueError("Please provide the console's IP address (shown in stream-conf.nro)")
 PORT = 8080
 HDR_FMT = "<II"
 HDR_SIZE = struct.calcsize(HDR_FMT)
 STREAM_MAGIC = 0x5357324A  # "SW2J"
+MAX_FRAME_SIZE = 4 * 1024 * 1024
 
-def recv_exact(sock, n):
-    buf = bytearray(n)
-    view = memoryview(buf)
+
+def recv_into_exact(sock, view, n):
     pos = 0
     while pos < n:
-        nbytes = sock.recv_into(view[pos:], n - pos)
+        nbytes = sock.recv_into(view[pos:n], n - pos)
         if nbytes == 0:
             raise ConnectionResetError("Connection closed by Switch")
         pos += nbytes
-    return bytes(buf)
+
 
 def main():
-    print(f"==================================================", flush=True)
-    print(f"     Switch 2 Live Stream Client (FFplay)         ", flush=True)
-    print(f"==================================================", flush=True)
+    print("==================================================", flush=True)
+    print("     Switch 2 Live Stream Client (FFplay)         ", flush=True)
+    print("==================================================", flush=True)
     print(f"Target Switch IP: {SWITCH_IP}:{PORT}")
-    print(f"Controls: Close ffplay window or press Ctrl+C to quit.\n", flush=True)
+    print("Controls: Close ffplay window or press Ctrl+C to quit.\n", flush=True)
 
     ffplay = None
     running = True
+    hdr_buf = bytearray(HDR_SIZE)
+    hdr_view = memoryview(hdr_buf)
+    frame_buf = bytearray(MAX_FRAME_SIZE)
+    frame_view = memoryview(frame_buf)
 
     try:
         while running:
@@ -47,6 +54,7 @@ def main():
 
                     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                     s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                    s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
                     s.settimeout(2.0)
                     s.connect((SWITCH_IP, PORT))
                     s.settimeout(10.0)
@@ -74,23 +82,23 @@ def main():
             try:
                 while running and ffplay.poll() is None:
                     try:
-                        hdr = recv_exact(sock, HDR_SIZE)
+                        recv_into_exact(sock, hdr_view, HDR_SIZE)
                     except (ConnectionResetError, ConnectionError, OSError, socket.timeout) as e:
                         print(f"\n[Connection interrupted: {e}. Reconnecting...]", flush=True)
                         break
 
-                    magic, frame_size = struct.unpack(HDR_FMT, hdr)
-                    if magic != STREAM_MAGIC or frame_size == 0 or frame_size > 10 * 1024 * 1024:
+                    magic, frame_size = struct.unpack(HDR_FMT, hdr_buf)
+                    if magic != STREAM_MAGIC or frame_size == 0 or frame_size > MAX_FRAME_SIZE:
                         continue
 
                     try:
-                        jpeg_data = recv_exact(sock, frame_size)
+                        recv_into_exact(sock, frame_view, frame_size)
                     except (ConnectionResetError, ConnectionError, OSError, socket.timeout) as e:
                         print(f"\n[Connection interrupted during payload: {e}. Reconnecting...]", flush=True)
                         break
 
                     try:
-                        ffplay.stdin.write(jpeg_data)
+                        ffplay.stdin.write(frame_view[:frame_size])
                         ffplay.stdin.flush()
                         ok_frames += 1
                         total_bytes += frame_size
@@ -123,6 +131,7 @@ def main():
             except Exception:
                 pass
         print("Stream client closed.", flush=True)
+
 
 if __name__ == "__main__":
     main()

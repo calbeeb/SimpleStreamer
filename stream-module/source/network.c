@@ -24,7 +24,7 @@ static bool send_all(int fd, const void* data, size_t len) {
     int retry_count = 0;
     while (sent < len) {
         size_t chunk = len - sent;
-        if (chunk > 16384) chunk = 16384; // 16 KB blocks to pace BSD TransferMemory mbufs smoothly
+        if (chunk > 262144) chunk = 262144; // 256 KB blocks: ~6 bsdSend IPC calls per 1.5 MB frame
         ssize_t n = send(fd, ptr + sent, chunk, 0);
         if (n < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR || errno == ENOBUFS || errno == ENOMEM) {
@@ -132,6 +132,9 @@ void network_thread_func(void* arg) {
         stream_write_log("Client connected via TCP.");
 
         u64 last_sent_seq = 0;
+        u64 net_window_frames = 0;
+        u64 net_window_start_tick = armGetSystemTick();
+        u64 perf_log_start_tick = net_window_start_tick;
 
         while (!atomic_load(&ctx->stop_requested) && atomic_load(&ctx->streaming_enabled)) {
             u64 frame_size = 0;
@@ -153,10 +156,13 @@ void network_thread_func(void* arg) {
 
             if (!atomic_load(&ctx->stop_requested) &&
                 atomic_load(&ctx->streaming_enabled) &&
-                ctx->stage_size > 0 &&
-                ctx->stage_size <= CAP_BUF_SIZE) {
-                frame_size = ctx->stage_size;
-                memcpy(ctx->net_buf, ctx->stage_buf, frame_size);
+                ctx->ready_size > 0 &&
+                ctx->ready_size <= CAP_BUF_SIZE) {
+                // Zero-copy triple-buffer swap: exchange net_idx with ready_idx
+                int tmp = ctx->net_idx;
+                ctx->net_idx = ctx->ready_idx;
+                ctx->ready_idx = tmp;
+                frame_size = ctx->ready_size;
                 last_sent_seq = ctx->frame_seq;
             }
             mutexUnlock(&ctx->buf_mutex);
@@ -165,24 +171,50 @@ void network_thread_func(void* arg) {
                 continue;
             }
 
+            // Write 8-byte header directly into the prefix page immediately before bufs[net_idx]
+            u8* pkt = ctx->bufs[ctx->net_idx] - sizeof(TcpFrameHeader);
             TcpFrameHeader hdr = {
                 .magic      = STREAM_MAGIC,
                 .frame_size = (u32)frame_size,
             };
+            memcpy(pkt, &hdr, sizeof(hdr));
 
-            // Send 8-byte frame header
-            if (!send_all(client_fd, &hdr, sizeof(hdr))) {
-                stream_write_log("Client disconnected (header send failed).");
+            u64 tx0 = armGetSystemTick();
+
+            // Send header + JPEG payload in a single contiguous send_all() pass
+            if (!send_all(client_fd, pkt, sizeof(hdr) + frame_size)) {
+                stream_write_log("Client disconnected (frame send failed).");
                 break;
             }
 
-            // Send JPEG payload from dedicated network buffer (never shared with caps2:s)
-            if (!send_all(client_fd, ctx->net_buf, frame_size)) {
-                stream_write_log("Client disconnected (payload send failed).");
-                break;
+            u64 tx1 = armGetSystemTick();
+            u32 net_us = (u32)(armTicksToNs(tx1 - tx0) / 1000ULL);
+            atomic_store(&ctx->last_net_us, net_us);
+
+            net_window_frames++;
+            u64 elapsed_ns = armTicksToNs(tx1 - net_window_start_tick);
+            if (elapsed_ns >= 1000000000ULL) {
+                double nfps = ((double)net_window_frames * 1000000000.0) / (double)elapsed_ns;
+                atomic_store(&ctx->net_fps_x100, (u32)(nfps * 100.0));
+                net_window_frames = 0;
+                net_window_start_tick = tx1;
+            }
+
+            if (armTicksToNs(tx1 - perf_log_start_tick) >= 5000000000ULL) {
+                perf_log_start_tick = tx1;
+                char perf_msg[160];
+                snprintf(perf_msg, sizeof(perf_msg),
+                         "[PERF] cap=%.1ffps (%.1fms) | net=%.1ffps (%.1fms) | size=%luKB",
+                         (double)atomic_load(&ctx->avg_fps_x100) / 100.0,
+                         (double)atomic_load(&ctx->last_cap_us) / 1000.0,
+                         (double)atomic_load(&ctx->net_fps_x100) / 100.0,
+                         (double)net_us / 1000.0,
+                         (unsigned long)(frame_size / 1024));
+                stream_write_log(perf_msg);
             }
         }
 
+        atomic_store(&ctx->net_fps_x100, 0);
         close(client_fd);
         atomic_store(&ctx->client_connected, false);
     }

@@ -23,7 +23,7 @@ typedef struct {
     u32 client_connected;
     u32 stream_port;
     u32 net_listening;
-    u32 reserved;
+    u32 net_fps_x100;
 } Caps2sStatus;
 
 _Static_assert(sizeof(Caps2sStatus) <= KAIHEN_PLUGIN_MESSAGE_SIZE, "Status must fit in 64-byte scalar reply");
@@ -32,10 +32,12 @@ typedef struct {
     Handle exit_write;
     Mutex buf_mutex;
     CondVar frame_cv;
-    u8* cap_buf;
-    u8* stage_buf;
-    u8* net_buf;
-    u64 stage_size;
+    u8* raw_bufs[3];
+    u8* bufs[3];
+    int cap_idx;
+    int ready_idx;
+    int net_idx;
+    u64 ready_size;
     u64 frame_seq;
     int listen_fd;
     atomic_bool stop_requested;
@@ -45,6 +47,9 @@ typedef struct {
     atomic_bool net_listening;
     atomic_uint_fast32_t last_rc;
     atomic_uint_fast32_t avg_fps_x100;
+    atomic_uint_fast32_t net_fps_x100;
+    atomic_uint_fast32_t last_cap_us;
+    atomic_uint_fast32_t last_net_us;
     atomic_uint_fast64_t frames_captured;
     atomic_uint_fast64_t last_frame_size;
 } CaptureContext;

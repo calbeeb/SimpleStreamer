@@ -100,7 +100,9 @@ int main(int argc, char* argv[]) {
 
         if (connected) {
             printf("Capture:     %s (caps2:s rc: 0x%x)\n", st.running ? "ACTIVE (Auto 1080p/720p JPEG)" : "IDLE / ERROR", st.last_rc);
-            printf("Live Speed:  %.2f FPS\n", (double)st.avg_fps_x100 / 100.0);
+            printf("Live Speed:  %.2f FPS (Capture) | %.2f FPS (Net TX)\n",
+                   (double)st.avg_fps_x100 / 100.0,
+                   (double)st.net_fps_x100 / 100.0);
             printf("Frames:      %lu\n", st.frames_captured);
             printf("Frame Size:  %lu bytes (%.1f KB)\n", st.last_frame_size, (double)st.last_frame_size / 1024.0);
             printf("TCP Server:  %s (Port %u)\n", st.net_listening ? "LISTENING" : "NOT BOUND / FAILED", st.stream_port ? st.stream_port : 8080);

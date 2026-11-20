@@ -33,11 +33,13 @@ void capture_thread_func(void* arg) {
     u64 window_start_tick = armGetSystemTick();
 
     while (!atomic_load(&ctx->stop_requested)) {
+        u64 t0 = armGetSystemTick();
         u64 out_size = 0;
         rc = serviceDispatchInOut(&caps2sSrv, 101, mode, out_size,
             .buffer_attrs = { SfBufferAttr_HipcAutoSelect | SfBufferAttr_Out | SfBufferAttr_HipcMapTransferAllowsNonSecure },
-            .buffers = { { ctx->cap_buf, CAP_BUF_SIZE } },
+            .buffers = { { ctx->bufs[ctx->cap_idx], CAP_BUF_SIZE } },
         );
+        u64 t1 = armGetSystemTick();
 
         atomic_store(&ctx->last_rc, rc);
 
@@ -55,13 +57,18 @@ void capture_thread_func(void* arg) {
         }
 
         if (R_SUCCEEDED(rc) && out_size > 0 && out_size <= CAP_BUF_SIZE) {
+            // Zero-copy triple-buffer swap: exchange cap_idx with ready_idx
             mutexLock(&ctx->buf_mutex);
-            memcpy(ctx->stage_buf, ctx->cap_buf, out_size);
-            ctx->stage_size = out_size;
+            int tmp = ctx->cap_idx;
+            ctx->cap_idx = ctx->ready_idx;
+            ctx->ready_idx = tmp;
+            ctx->ready_size = out_size;
             ctx->frame_seq++;
             condvarWakeAll(&ctx->frame_cv);
             mutexUnlock(&ctx->buf_mutex);
 
+            u32 cap_us = (u32)(armTicksToNs(t1 - t0) / 1000ULL);
+            atomic_store(&ctx->last_cap_us, cap_us);
             atomic_fetch_add(&ctx->frames_captured, 1);
             atomic_store(&ctx->last_frame_size, out_size);
 
@@ -101,12 +108,12 @@ void capture_thread_func(void* arg) {
 Result capture_save_latest_frame(CaptureContext* ctx, const char* path) {
     Result save_rc = MAKERESULT(Module_Libnx, LibnxError_NotFound);
     mutexLock(&ctx->buf_mutex);
-    if (ctx->stage_size > 0 && ctx->stage_size <= CAP_BUF_SIZE) {
+    if (ctx->ready_size > 0 && ctx->ready_size <= CAP_BUF_SIZE) {
         FILE* f = fopen(path, "wb");
         if (f) {
-            size_t written = fwrite(ctx->stage_buf, 1, ctx->stage_size, f);
+            size_t written = fwrite(ctx->bufs[ctx->ready_idx], 1, ctx->ready_size, f);
             fclose(f);
-            if (written == ctx->stage_size) {
+            if (written == ctx->ready_size) {
                 save_rc = 0;
             }
         }
