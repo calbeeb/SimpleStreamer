@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "stream.h"
 
@@ -11,31 +12,62 @@ void stream_write_log(const char* msg) {
     }
 }
 
+static bool capture_needed(CaptureContext* ctx) {
+    if (atomic_load(&ctx->stop_requested)) return false;
+    if (!atomic_load(&ctx->streaming_enabled)) return false;
+    return atomic_load(&ctx->client_connected) || atomic_load(&ctx->usb_client_connected);
+}
+
 void capture_thread_func(void* arg) {
     CaptureContext* ctx = (CaptureContext*)arg;
 
-    Service caps2sSrv;
-    Result rc = smGetService(&caps2sSrv, "caps2:s");
-    atomic_store(&ctx->last_rc, rc);
-
-    char log_line[128];
-    snprintf(log_line, sizeof(log_line), "smGetService(caps2:s) -> 0x%x", rc);
-    stream_write_log(log_line);
-
-    if (R_FAILED(rc)) {
-        return;
-    }
-
-    atomic_store(&ctx->running, true);
-
+    Service caps2sSrv = {0};
+    bool caps2s_open = false;
     u32 mode = CAPS2S_MODE_1080P_JPEG;
     u64 window_frames = 0;
-    u64 window_start_tick = armGetSystemTick();
+    u64 window_start_tick = 0;
+    Result last_logged_err = 0;
+
+    stream_write_log("Capture thread started (lazy caps2:s mode: opens on viewer connect).");
 
     while (!atomic_load(&ctx->stop_requested)) {
+        if (!capture_needed(ctx)) {
+            if (caps2s_open) {
+                serviceClose(&caps2sSrv);
+                memset(&caps2sSrv, 0, sizeof(caps2sSrv));
+                caps2s_open = false;
+                atomic_store(&ctx->running, false);
+                atomic_store(&ctx->avg_fps_x100, 0);
+                last_logged_err = 0;
+                stream_write_log("caps2:s closed (no active viewer; screenshots re-enabled).");
+            }
+            svcSleepThread(20000000ULL); // 20 ms standby poll
+            continue;
+        }
+
+        if (!caps2s_open) {
+            Result open_rc = smGetService(&caps2sSrv, "caps2:s");
+            atomic_store(&ctx->last_rc, open_rc);
+
+            char log_line[128];
+            snprintf(log_line, sizeof(log_line), "smGetService(caps2:s) -> 0x%x", open_rc);
+            stream_write_log(log_line);
+
+            if (R_FAILED(open_rc)) {
+                svcSleepThread(250000000ULL);
+                continue;
+            }
+
+            caps2s_open = true;
+            atomic_store(&ctx->running, true);
+            window_frames = 0;
+            window_start_tick = armGetSystemTick();
+            last_logged_err = 0;
+        }
+
         u64 t0 = armGetSystemTick();
         u64 out_size = 0;
-        rc = serviceDispatchInOut(&caps2sSrv, 101, mode, out_size,
+        Result rc = serviceDispatchInOut(&caps2sSrv, 101, mode, out_size,
             .buffer_attrs = { SfBufferAttr_HipcAutoSelect | SfBufferAttr_Out | SfBufferAttr_HipcMapTransferAllowsNonSecure },
             .buffers = { { ctx->bufs[ctx->cap_idx], CAP_BUF_SIZE } },
         );
@@ -84,7 +116,6 @@ void capture_thread_func(void* arg) {
             }
         } else {
             // Log any unexpected error code once
-            static Result last_logged_err = 0;
             if (rc != last_logged_err) {
                 last_logged_err = rc;
                 char err_buf[64];
@@ -101,24 +132,71 @@ void capture_thread_func(void* arg) {
     condvarWakeAll(&ctx->frame_cv);
     mutexUnlock(&ctx->buf_mutex);
 
+    if (caps2s_open) {
+        serviceClose(&caps2sSrv);
+    }
     atomic_store(&ctx->running, false);
-    serviceClose(&caps2sSrv);
+    atomic_store(&ctx->avg_fps_x100, 0);
     stream_write_log("Capture thread stopped cleanly.");
 }
 
 Result capture_save_latest_frame(CaptureContext* ctx, const char* path) {
-    Result save_rc = MAKERESULT(Module_Libnx, LibnxError_NotFound);
-    mutexLock(&ctx->buf_mutex);
-    if (ctx->ready_size > 0 && ctx->ready_size <= CAP_BUF_SIZE) {
-        FILE* f = fopen(path, "wb");
-        if (f) {
-            size_t written = fwrite(ctx->bufs[ctx->ready_idx], 1, ctx->ready_size, f);
-            fclose(f);
-            if (written == ctx->ready_size) {
-                save_rc = 0;
+    // Fast path: if live capture is currently active, write the latest buffered frame
+    if (atomic_load(&ctx->running)) {
+        Result save_rc = MAKERESULT(Module_Libnx, LibnxError_NotFound);
+        mutexLock(&ctx->buf_mutex);
+        if (ctx->ready_size > 0 && ctx->ready_size <= CAP_BUF_SIZE) {
+            FILE* f = fopen(path, "wb");
+            if (f) {
+                size_t written = fwrite(ctx->bufs[ctx->ready_idx], 1, ctx->ready_size, f);
+                fclose(f);
+                if (written == ctx->ready_size) {
+                    save_rc = 0;
+                }
             }
         }
+        mutexUnlock(&ctx->buf_mutex);
+        return save_rc;
     }
-    mutexUnlock(&ctx->buf_mutex);
-    return save_rc;
+
+    // Standby path (caps2:s is closed): perform a one-shot open -> capture -> close
+    u8* tmp_buf = (u8*)aligned_alloc(0x1000, CAP_BUF_SIZE);
+    if (!tmp_buf) {
+        return MAKERESULT(Module_Libnx, LibnxError_OutOfMemory);
+    }
+
+    Service srv = {0};
+    Result rc = smGetService(&srv, "caps2:s");
+    if (R_FAILED(rc)) {
+        free(tmp_buf);
+        return rc;
+    }
+
+    u32 modes[2] = { CAPS2S_MODE_1080P_JPEG, CAPS2S_MODE_720P_JPEG };
+    u64 out_size = 0;
+    for (int i = 0; i < 2; i++) {
+        out_size = 0;
+        rc = serviceDispatchInOut(&srv, 101, modes[i], out_size,
+            .buffer_attrs = { SfBufferAttr_HipcAutoSelect | SfBufferAttr_Out | SfBufferAttr_HipcMapTransferAllowsNonSecure },
+            .buffers = { { tmp_buf, CAP_BUF_SIZE } },
+        );
+        if (rc != 0x104110) break;
+    }
+    serviceClose(&srv);
+
+    if (R_SUCCEEDED(rc) && out_size > 0 && out_size <= CAP_BUF_SIZE) {
+        FILE* f = fopen(path, "wb");
+        if (f) {
+            size_t written = fwrite(tmp_buf, 1, out_size, f);
+            fclose(f);
+            rc = (written == out_size) ? 0 : MAKERESULT(Module_Libnx, LibnxError_IoError);
+        } else {
+            rc = MAKERESULT(Module_Libnx, LibnxError_IoError);
+        }
+    } else if (R_SUCCEEDED(rc)) {
+        rc = MAKERESULT(Module_Libnx, LibnxError_NotFound);
+    }
+
+    free(tmp_buf);
+    return rc;
 }

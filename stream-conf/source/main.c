@@ -153,7 +153,9 @@ int main(int argc, char* argv[]) {
             bool usb_active   = (st.flags & STATUS_FLAG_USB_ACTIVE) != 0;
             bool usb_conn     = (st.flags & STATUS_FLAG_USB_CLIENT_CONNECTED) != 0;
 
-            printf("Capture:     %s (caps2:s rc: 0x%x)\n", running ? "ACTIVE (Auto 1080p/720p JPEG)" : "IDLE / ERROR", st.last_rc);
+            const char* cap_str = running ? "ACTIVE (Auto 1080p/720p JPEG)"
+                                          : (st.last_rc == 0 ? "STANDBY (caps2:s closed)" : "ERROR");
+            printf("Capture:     %s (caps2:s rc: 0x%x)\n", cap_str, st.last_rc);
             printf("Live Speed:  %.2f FPS (Cap) | %.2f FPS (TCP) | %.2f FPS (USB)\n",
                    (double)st.avg_fps_x100 / 100.0,
                    (double)st.net_fps_x100 / 100.0,
