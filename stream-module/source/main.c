@@ -20,16 +20,20 @@ static Result pluginCommand(u32 command_id, const void* input,
 
     if (command_id == 0) {
         Caps2sStatus st = {
-            .running           = atomic_load(&ctx->running) ? 1 : 0,
-            .avg_fps_x100      = atomic_load(&ctx->avg_fps_x100),
-            .last_rc           = atomic_load(&ctx->last_rc),
-            .streaming_enabled = atomic_load(&ctx->streaming_enabled) ? 1 : 0,
-            .frames_captured   = atomic_load(&ctx->frames_captured),
-            .last_frame_size   = atomic_load(&ctx->last_frame_size),
-            .client_connected  = atomic_load(&ctx->client_connected) ? 1 : 0,
-            .stream_port       = STREAM_PORT,
-            .net_listening     = atomic_load(&ctx->net_listening) ? 1 : 0,
-            .net_fps_x100      = atomic_load(&ctx->net_fps_x100),
+            .running                = atomic_load(&ctx->running) ? 1 : 0,
+            .avg_fps_x100           = atomic_load(&ctx->avg_fps_x100),
+            .last_rc                = atomic_load(&ctx->last_rc),
+            .streaming_enabled      = atomic_load(&ctx->streaming_enabled) ? 1 : 0,
+            .frames_captured        = atomic_load(&ctx->frames_captured),
+            .last_frame_size        = atomic_load(&ctx->last_frame_size),
+            .client_connected       = atomic_load(&ctx->client_connected) ? 1 : 0,
+            .stream_port            = STREAM_PORT,
+            .net_listening          = atomic_load(&ctx->net_listening) ? 1 : 0,
+            .net_fps_x100           = atomic_load(&ctx->net_fps_x100),
+            .audio_listening        = atomic_load(&ctx->audio_listening) ? 1 : 0,
+            .audio_enabled          = atomic_load(&ctx->audio_enabled) ? 1 : 0,
+            .audio_client_connected = atomic_load(&ctx->audio_client_connected) ? 1 : 0,
+            .audio_last_rc          = atomic_load(&ctx->audio_last_rc),
         };
         memcpy(output, &st, sizeof(st));
         *output_size = sizeof(st);
@@ -48,6 +52,10 @@ static Result pluginCommand(u32 command_id, const void* input,
             close(ctx->listen_fd);
             ctx->listen_fd = -1;
         }
+        if (ctx->audio_listen_fd >= 0) {
+            close(ctx->audio_listen_fd);
+            ctx->audio_listen_fd = -1;
+        }
         return svcSignalEvent(ctx->exit_write);
     }
 
@@ -57,6 +65,13 @@ static Result pluginCommand(u32 command_id, const void* input,
         mutexLock(&ctx->buf_mutex);
         condvarWakeAll(&ctx->frame_cv);
         mutexUnlock(&ctx->buf_mutex);
+        *output_size = 0;
+        return 0;
+    }
+
+    if (command_id == 4) {
+        bool cur = atomic_load(&ctx->audio_enabled);
+        atomic_store(&ctx->audio_enabled, !cur);
         *output_size = 0;
         return 0;
     }
@@ -98,7 +113,7 @@ int main(void) {
         .udp_tx_buf_size     = 0x2400,
         .udp_rx_buf_size     = 0xA500,
         .sb_efficiency       = 4,
-        .num_bsd_sessions    = 3,
+        .num_bsd_sessions    = 6,
         .bsd_service_type    = BsdServiceType_User,
     };
     Result sock_rc = socketInitialize(&sock_cfg);
@@ -121,6 +136,7 @@ int main(void) {
 
     CaptureContext ctx = {0};
     ctx.listen_fd = -1;
+    ctx.audio_listen_fd = -1;
     ctx.cap_idx   = 0;
     ctx.ready_idx = 1;
     ctx.net_idx   = 2;
@@ -131,7 +147,11 @@ int main(void) {
     atomic_init(&ctx.streaming_enabled, true);
     atomic_init(&ctx.client_connected, false);
     atomic_init(&ctx.net_listening, false);
+    atomic_init(&ctx.audio_enabled, true);
+    atomic_init(&ctx.audio_listening, false);
+    atomic_init(&ctx.audio_client_connected, false);
     atomic_init(&ctx.last_rc, 0);
+    atomic_init(&ctx.audio_last_rc, 0);
     atomic_init(&ctx.avg_fps_x100, 0);
     atomic_init(&ctx.net_fps_x100, 0);
     atomic_init(&ctx.last_cap_us, 0);
@@ -164,8 +184,10 @@ int main(void) {
 
     Thread cap_thread = {0};
     Thread net_thread = {0};
+    Thread audio_thread = {0};
     bool cap_ok = false;
     bool net_ok = false;
+    bool audio_ok = false;
 
     // Pick lowest/highest allowed cores if multiple cores exist so net_thread never contends with capsrv2
     s32 cap_core = -2;
@@ -175,8 +197,8 @@ int main(void) {
         net_core = 63 - __builtin_clzll(core_mask);
     }
 
-    // Keep cap_thread (0x24) and net_thread (0x28) strictly below capsrv2's 0x22 worker threads
-    // so net_thread never preempts JPEG encoding inside capsrv2, yet stay above game threads (0x2C).
+    // Keep cap_thread (0x24) and net_thread/audio_thread (0x28) strictly below capsrv2's 0x22 worker threads
+    // so network I/O never preempts JPEG encoding inside capsrv2, yet stay above game threads (0x2C).
     static const int cap_prios[] = { 0x24, 0x26, 0x28, 0x2B, 0x2C };
     static const int net_prios[] = { 0x28, 0x2A, 0x2B, 0x2C };
 
@@ -188,6 +210,11 @@ int main(void) {
     if (R_SUCCEEDED(rc) && sock_inited && create_tuned_thread(&net_thread, network_thread_func, &ctx,
             net_prios, sizeof(net_prios)/sizeof(net_prios[0]), net_core, "net_thread")) {
         net_ok = R_SUCCEEDED(threadStart(&net_thread));
+    }
+
+    if (R_SUCCEEDED(rc) && sock_inited && create_tuned_thread(&audio_thread, audio_thread_func, &ctx,
+            net_prios, sizeof(net_prios)/sizeof(net_prios[0]), net_core, "audio_thread")) {
+        audio_ok = R_SUCCEEDED(threadStart(&audio_thread));
     }
 
     if (R_SUCCEEDED(rc)) {
@@ -203,9 +230,14 @@ int main(void) {
         close(ctx.listen_fd);
         ctx.listen_fd = -1;
     }
+    if (ctx.audio_listen_fd >= 0) {
+        close(ctx.audio_listen_fd);
+        ctx.audio_listen_fd = -1;
+    }
 
     if (cap_ok) { threadWaitForExit(&cap_thread); threadClose(&cap_thread); }
     if (net_ok) { threadWaitForExit(&net_thread); threadClose(&net_thread); }
+    if (audio_ok) { threadWaitForExit(&audio_thread); threadClose(&audio_thread); }
     if (service.started) pluginServiceStop(&service);
 
     if (exit_read != INVALID_HANDLE) svcCloseHandle(exit_read);

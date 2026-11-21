@@ -3,7 +3,7 @@
 ## About
 ### Requires a stable & strong network connection, bitrates can exceed *250* Mbps
 
-This repo is a proof of concept for display streaming from a jailbroken Switch 2 to another device. It uses the `caps2:s` service to create a 1080p MJPEG stream targeting 30fps and streams it to a client over TCP. It does not reach this target and it is unlikely it will in the near future.
+This repo is a proof of concept for display streaming from a jailbroken Switch 2 to another device. It uses the `caps2:s` service to create a 1080p MJPEG stream targeting 30fps, alongside `auddmg:u` and `audsmx:u` for 48kHz 16-bit stereo audio, and streams both to a client over TCP. It does not reach the 30fps target and it is unlikely it will in the near future.
 
 This README is human-written, but the code & research behind this project are **significantly AI-assisted**.
 
@@ -12,14 +12,16 @@ Only tested on a v23.0.1 Switch 2 running kurumuz's ns2jb through SmileBASIC 4, 
 ## Features
 
 * Streams MJPEG over TCP to a connected client
-* 1920x1080 capture at up to 30fps
-    * *See more in `Performance details` below*
+    * 1920x1080 capture at up to 30fps
+        * *See more in `Performance details` below*
+* Streams stereo audio over TCP to the same connected client
+    * 48kHz & 16-bit, with volume controls
 * Two client options:
     * The cv2-client is multi-threaded, displays live FPS and bitrate stats in the window title, and includes a half-scale decode toggle.
         * *Toggled with* `H` *, half-scale decode reduces the client output to 960x540. Should improve playback performance if you are bottlenecked by decoding on the client side.*
     * The ffplay-client is a simple, lightweight alternative.
 * Stream module configuration:
-    * `stream-conf.nro` allows for the `stream-module` plugin to be stopped and for the network stream to be toggled.
+    * `stream-conf.nro` allows for the audio stream to be toggled, the network stream to be toggled, and for the `stream-module` plugin to be stopped.
         * *plugins cannot be restarted without re-running kaiHEN from a fresh boot*
 * Client and host monitoring:
     * Both client players report the received framerate, frame size, and bitrate
@@ -54,13 +56,17 @@ With the correct files on the SD card, the stream should be available as soon as
 For `cv2-client.py`: 
 1. Ensure `opencv-python` is installed
 2. Run `python cv2-client.py <SWITCH2-IP>`
-    * Press `h` to enable half-scale decoding. Useful if you are struggling to decode fast enough (Disp < Net in the stream stats) 
+    * Press `h` to enable half-scale decoding. Useful if you are struggling to decode fast enough (Disp < Net in the stream stats)
+    * Press `Up/Down Arrow` to increase and decrease stream volume in steps of 5% 
+    * Press `m` to mute/unmute the stream
 3. Press `Esc` or `q` to quit the stream.
 
 
 For `ffplay-client.py`: 
 1. Ensure `ffmpeg` is installed
 2. Run `python ffplay-client.py <SWITCH2-IP>`
+    * Press `Up/Down Arrow` to increase and decrease stream volume in steps of 5%. Make sure you've clicked on the terminal first.
+    * Press `m` to mute/unmute the stream. Make sure you've clicked on the terminal first.
 3. Press `Esc` or `q` to quit the stream.
 
 ## Building

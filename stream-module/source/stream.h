@@ -12,6 +12,7 @@
 #define CAPS2S_MODE_1080P_RAW  0x00010200
 #define CAPS2S_MODE_720P_RAW   0x00010100
 #define STREAM_PORT            8080
+#define AUDIO_STREAM_PORT      8081
 
 typedef struct {
     u32 running;
@@ -24,6 +25,10 @@ typedef struct {
     u32 stream_port;
     u32 net_listening;
     u32 net_fps_x100;
+    u32 audio_listening;
+    u32 audio_enabled;
+    u32 audio_client_connected;
+    Result audio_last_rc;
 } Caps2sStatus;
 
 _Static_assert(sizeof(Caps2sStatus) <= KAIHEN_PLUGIN_MESSAGE_SIZE, "Status must fit in 64-byte scalar reply");
@@ -40,12 +45,17 @@ typedef struct {
     u64 ready_size;
     u64 frame_seq;
     int listen_fd;
+    int audio_listen_fd;
     atomic_bool stop_requested;
     atomic_bool running;
     atomic_bool streaming_enabled;
     atomic_bool client_connected;
     atomic_bool net_listening;
+    atomic_bool audio_enabled;
+    atomic_bool audio_listening;
+    atomic_bool audio_client_connected;
     atomic_uint_fast32_t last_rc;
+    atomic_uint_fast32_t audio_last_rc;
     atomic_uint_fast32_t avg_fps_x100;
     atomic_uint_fast32_t net_fps_x100;
     atomic_uint_fast32_t last_cap_us;
@@ -58,3 +68,4 @@ void stream_write_log(const char* msg);
 void capture_thread_func(void* arg);
 Result capture_save_latest_frame(CaptureContext* ctx, const char* path);
 void network_thread_func(void* arg);
+void audio_thread_func(void* arg);

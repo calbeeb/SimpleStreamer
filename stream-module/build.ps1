@@ -41,7 +41,7 @@ $cflags = @(
     "-Isource"
 )
 
-$sources = @("main.c", "capture.c", "network.c")
+$sources = @("main.c", "capture.c", "network.c", "audio.c")
 $objs = @()
 
 foreach ($src in $sources) {

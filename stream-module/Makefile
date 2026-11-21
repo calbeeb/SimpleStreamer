@@ -16,7 +16,7 @@ LDFLAGS := $(ARCH) -specs=$(DEVKITPRO)/libounce/switch.specs -Wl,--gc-sections
 LIBS := -L$(DEVKITPRO)/portlibs/switch2/lib -L$(DEVKITPRO)/libounce/lib \
     -lkaihen_plugin -lounce_core
 
-OBJS := $(BUILD)/main.o $(BUILD)/capture.o $(BUILD)/network.o
+OBJS := $(BUILD)/main.o $(BUILD)/capture.o $(BUILD)/network.o $(BUILD)/audio.o
 
 all: $(TARGET).nso
 

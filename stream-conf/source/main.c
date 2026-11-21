@@ -62,6 +62,16 @@ int main(int argc, char* argv[]) {
             }
         }
 
+        // [R] Toggle audio streaming on/off (Cmd 4)
+        if ((kDown & HidNpadButton_R) && connected) {
+            Result audRc = serviceDispatch(&pluginSrv, 4);
+            if (R_SUCCEEDED(audRc)) {
+                snprintf(statusMsg, sizeof(statusMsg), "Toggled audio streaming.");
+            } else {
+                snprintf(statusMsg, sizeof(statusMsg), "Audio toggle failed: 0x%x", audRc);
+            }
+        }
+
         // [X] Stop & exit background capture plugin (Cmd 2)
         if ((kDown & HidNpadButton_X) && connected) {
             Result stopRc = serviceDispatch(&pluginSrv, 2);
@@ -106,6 +116,11 @@ int main(int argc, char* argv[]) {
             printf("Frames:      %lu\n", st.frames_captured);
             printf("Frame Size:  %lu bytes (%.1f KB)\n", st.last_frame_size, (double)st.last_frame_size / 1024.0);
             printf("TCP Server:  %s (Port %u)\n", st.net_listening ? "LISTENING" : "NOT BOUND / FAILED", st.stream_port ? st.stream_port : 8080);
+            printf("Audio TCP:   %s (Port 8081 | %s | %s | rc: 0x%x)\n",
+                   st.audio_listening ? "LISTENING" : "OFF / FAILED",
+                   st.audio_enabled ? "ENABLED" : "PAUSED",
+                   st.audio_client_connected ? "PC CONNECTED" : "WAITING",
+                   st.audio_last_rc);
             printf("\nConnect CMD: python cv2-client.py %s\n", ipStr);
             printf("Net Stream:  %s | Viewer: %s\n",
                    st.streaming_enabled ? "ENABLED" : "PAUSED",
@@ -117,6 +132,7 @@ int main(int argc, char* argv[]) {
         printf("---------------------------------------\n\n");
         printf("[A] Save Frame to SD (sdmc:/kaihen_caps2s_frame.jpg)\n");
         printf("[B] Toggle Network Stream ON/OFF\n");
+        printf("[R] Toggle Audio Stream ON/OFF\n");
         printf("[X] Stop Background Plugin\n");
         printf("[Y] Reconnect to Plugin\n");
         printf("[+] Exit Config (keeps background stream running)\n");
