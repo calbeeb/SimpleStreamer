@@ -19,21 +19,32 @@ static Result pluginCommand(u32 command_id, const void* input,
     CaptureContext* ctx = (CaptureContext*)context;
 
     if (command_id == 0) {
+        u32 flags = 0;
+        if (atomic_load(&ctx->running))                flags |= STATUS_FLAG_RUNNING;
+        if (atomic_load(&ctx->streaming_enabled))      flags |= STATUS_FLAG_STREAMING_ENABLED;
+        if (atomic_load(&ctx->client_connected))       flags |= STATUS_FLAG_CLIENT_CONNECTED;
+        if (atomic_load(&ctx->net_listening))          flags |= STATUS_FLAG_NET_LISTENING;
+        if (atomic_load(&ctx->audio_listening))        flags |= STATUS_FLAG_AUDIO_LISTENING;
+        if (atomic_load(&ctx->audio_enabled))          flags |= STATUS_FLAG_AUDIO_ENABLED;
+        if (atomic_load(&ctx->audio_client_connected)) flags |= STATUS_FLAG_AUDIO_CLIENT_CONNECTED;
+        if (atomic_load(&ctx->usb_enabled))            flags |= STATUS_FLAG_USB_ENABLED;
+        if (atomic_load(&ctx->usb_active))             flags |= STATUS_FLAG_USB_ACTIVE;
+        if (atomic_load(&ctx->usb_client_connected))   flags |= STATUS_FLAG_USB_CLIENT_CONNECTED;
+
         Caps2sStatus st = {
-            .running                = atomic_load(&ctx->running) ? 1 : 0,
-            .avg_fps_x100           = atomic_load(&ctx->avg_fps_x100),
-            .last_rc                = atomic_load(&ctx->last_rc),
-            .streaming_enabled      = atomic_load(&ctx->streaming_enabled) ? 1 : 0,
-            .frames_captured        = atomic_load(&ctx->frames_captured),
-            .last_frame_size        = atomic_load(&ctx->last_frame_size),
-            .client_connected       = atomic_load(&ctx->client_connected) ? 1 : 0,
-            .stream_port            = STREAM_PORT,
-            .net_listening          = atomic_load(&ctx->net_listening) ? 1 : 0,
-            .net_fps_x100           = atomic_load(&ctx->net_fps_x100),
-            .audio_listening        = atomic_load(&ctx->audio_listening) ? 1 : 0,
-            .audio_enabled          = atomic_load(&ctx->audio_enabled) ? 1 : 0,
-            .audio_client_connected = atomic_load(&ctx->audio_client_connected) ? 1 : 0,
-            .audio_last_rc          = atomic_load(&ctx->audio_last_rc),
+            .flags           = flags,
+            .avg_fps_x100    = atomic_load(&ctx->avg_fps_x100),
+            .last_rc         = atomic_load(&ctx->last_rc),
+            .net_fps_x100    = atomic_load(&ctx->net_fps_x100),
+            .frames_captured = atomic_load(&ctx->frames_captured),
+            .last_frame_size = atomic_load(&ctx->last_frame_size),
+            .usb_fps_x100    = atomic_load(&ctx->usb_fps_x100),
+            .audio_last_rc   = atomic_load(&ctx->audio_last_rc),
+            .usb_last_rc     = atomic_load(&ctx->usb_last_rc),
+            .stream_port     = STREAM_PORT,
+            .usb_state       = (u8)atomic_load(&ctx->usb_state),
+            .usb_speed       = (u8)atomic_load(&ctx->usb_speed),
+            .reserved        = 0,
         };
         memcpy(output, &st, sizeof(st));
         *output_size = sizeof(st);
@@ -72,6 +83,16 @@ static Result pluginCommand(u32 command_id, const void* input,
     if (command_id == 4) {
         bool cur = atomic_load(&ctx->audio_enabled);
         atomic_store(&ctx->audio_enabled, !cur);
+        *output_size = 0;
+        return 0;
+    }
+
+    if (command_id == 5) {
+        bool cur = atomic_load(&ctx->usb_enabled);
+        atomic_store(&ctx->usb_enabled, !cur);
+        mutexLock(&ctx->buf_mutex);
+        condvarWakeAll(&ctx->frame_cv);
+        mutexUnlock(&ctx->buf_mutex);
         *output_size = 0;
         return 0;
     }
@@ -121,6 +142,7 @@ int main(void) {
         sock_rc = socketInitializeDefault();
     }
     bool sock_inited = R_SUCCEEDED(sock_rc);
+    bool nifm_inited = R_SUCCEEDED(nifmInitialize(NifmServiceType_User));
 
     u64 core_mask = 0;
     svcGetInfo(&core_mask, InfoType_CoreMask, CUR_PROCESS_HANDLE, 0);
@@ -128,8 +150,8 @@ int main(void) {
     if (sd_mounted) {
         FILE* f = fopen("sdmc:/kaihen_caps2s.log", "w");
         if (f) {
-            fprintf(f, "stream-module started (fs=%d, sd=%d, sock_rc=0x%x, core_mask=0x%lx)\n",
-                    fs_inited, sd_mounted, sock_rc, (unsigned long)core_mask);
+            fprintf(f, "stream-module started (fs=%d, sd=%d, sock_rc=0x%x, nifm=%d, core_mask=0x%lx)\n",
+                    fs_inited, sd_mounted, sock_rc, nifm_inited, (unsigned long)core_mask);
             fclose(f);
         }
     }
@@ -140,6 +162,7 @@ int main(void) {
     ctx.cap_idx   = 0;
     ctx.ready_idx = 1;
     ctx.net_idx   = 2;
+    ctx.usb_idx   = 3;
     mutexInit(&ctx.buf_mutex);
     condvarInit(&ctx.frame_cv);
     atomic_init(&ctx.stop_requested, false);
@@ -150,28 +173,38 @@ int main(void) {
     atomic_init(&ctx.audio_enabled, true);
     atomic_init(&ctx.audio_listening, false);
     atomic_init(&ctx.audio_client_connected, false);
+    atomic_init(&ctx.usb_enabled, true);
+    atomic_init(&ctx.usb_active, false);
+    atomic_init(&ctx.usb_client_connected, false);
+    atomic_init(&ctx.nifm_inited, nifm_inited);
     atomic_init(&ctx.last_rc, 0);
     atomic_init(&ctx.audio_last_rc, 0);
+    atomic_init(&ctx.usb_last_rc, 0);
+    atomic_init(&ctx.usb_state, 0);
+    atomic_init(&ctx.usb_speed, 0);
     atomic_init(&ctx.avg_fps_x100, 0);
     atomic_init(&ctx.net_fps_x100, 0);
+    atomic_init(&ctx.usb_fps_x100, 0);
     atomic_init(&ctx.last_cap_us, 0);
     atomic_init(&ctx.last_net_us, 0);
     atomic_init(&ctx.frames_captured, 0);
     atomic_init(&ctx.last_frame_size, 0);
 
-    // Zero-copy atomic triple-buffering with a 4 KB prefix page per buffer:
-    // - bufs[i] = raw_bufs[i] + 0x1000 (page-aligned 4 MB region passed to caps2:s)
-    // - net_thread writes TcpFrameHeader to bufs[net_idx] - 8 for single-pass send()
-    for (int i = 0; i < 3; i++) {
+    // Zero-copy quad-buffering with a 4 KB prefix page per buffer:
+    // - bufs[i] = raw_bufs[i] + 0x1000 (4 KB page-aligned 4 MB region for caps2:s & usb:ds DMA)
+    // - net_thread writes TcpFrameHeader to bufs[net_idx] - 8 for single-pass TCP send()
+    bool bufs_ok = true;
+    for (int i = 0; i < CAP_BUF_COUNT; i++) {
         ctx.raw_bufs[i] = (u8*)aligned_alloc(0x1000, CAP_BUF_SIZE + 0x1000);
         ctx.bufs[i]     = ctx.raw_bufs[i] ? (ctx.raw_bufs[i] + 0x1000) : NULL;
+        if (!ctx.bufs[i]) bufs_ok = false;
     }
 
     Handle exit_write = INVALID_HANDLE;
     Handle exit_read = INVALID_HANDLE;
     PluginService service = {0};
 
-    if (!ctx.bufs[0] || !ctx.bufs[1] || !ctx.bufs[2]) {
+    if (!bufs_ok) {
         rc = MAKERESULT(Module_Libnx, LibnxError_OutOfMemory);
     } else {
         rc = svcCreateEvent(&exit_write, &exit_read);
@@ -185,11 +218,12 @@ int main(void) {
     Thread cap_thread = {0};
     Thread net_thread = {0};
     Thread audio_thread = {0};
+    Thread usb_thread = {0};
     bool cap_ok = false;
     bool net_ok = false;
     bool audio_ok = false;
+    bool usb_ok = false;
 
-    // Pick lowest/highest allowed cores if multiple cores exist so net_thread never contends with capsrv2
     s32 cap_core = -2;
     s32 net_core = -2;
     if (__builtin_popcountll(core_mask) >= 2) {
@@ -197,8 +231,6 @@ int main(void) {
         net_core = 63 - __builtin_clzll(core_mask);
     }
 
-    // Keep cap_thread (0x24) and net_thread/audio_thread (0x28) strictly below capsrv2's 0x22 worker threads
-    // so network I/O never preempts JPEG encoding inside capsrv2, yet stay above game threads (0x2C).
     static const int cap_prios[] = { 0x24, 0x26, 0x28, 0x2B, 0x2C };
     static const int net_prios[] = { 0x28, 0x2A, 0x2B, 0x2C };
 
@@ -215,6 +247,11 @@ int main(void) {
     if (R_SUCCEEDED(rc) && sock_inited && create_tuned_thread(&audio_thread, audio_thread_func, &ctx,
             net_prios, sizeof(net_prios)/sizeof(net_prios[0]), net_core, "audio_thread")) {
         audio_ok = R_SUCCEEDED(threadStart(&audio_thread));
+    }
+
+    if (R_SUCCEEDED(rc) && create_tuned_thread(&usb_thread, usb_thread_func, &ctx,
+            net_prios, sizeof(net_prios)/sizeof(net_prios[0]), net_core, "usb_thread")) {
+        usb_ok = R_SUCCEEDED(threadStart(&usb_thread));
     }
 
     if (R_SUCCEEDED(rc)) {
@@ -235,18 +272,20 @@ int main(void) {
         ctx.audio_listen_fd = -1;
     }
 
-    if (cap_ok) { threadWaitForExit(&cap_thread); threadClose(&cap_thread); }
-    if (net_ok) { threadWaitForExit(&net_thread); threadClose(&net_thread); }
+    if (cap_ok)   { threadWaitForExit(&cap_thread);   threadClose(&cap_thread); }
+    if (net_ok)   { threadWaitForExit(&net_thread);   threadClose(&net_thread); }
     if (audio_ok) { threadWaitForExit(&audio_thread); threadClose(&audio_thread); }
+    if (usb_ok)   { threadWaitForExit(&usb_thread);   threadClose(&usb_thread); }
     if (service.started) pluginServiceStop(&service);
 
     if (exit_read != INVALID_HANDLE) svcCloseHandle(exit_read);
     if (exit_write != INVALID_HANDLE) svcCloseHandle(exit_write);
 
-    free(ctx.raw_bufs[0]);
-    free(ctx.raw_bufs[1]);
-    free(ctx.raw_bufs[2]);
+    for (int i = 0; i < CAP_BUF_COUNT; i++) {
+        free(ctx.raw_bufs[i]);
+    }
 
+    if (nifm_inited) nifmExit();
     if (sock_inited) socketExit();
     if (sd_mounted) fsdevUnmountAll();
     if (fs_inited) fsExit();

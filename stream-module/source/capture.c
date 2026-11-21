@@ -57,13 +57,14 @@ void capture_thread_func(void* arg) {
         }
 
         if (R_SUCCEEDED(rc) && out_size > 0 && out_size <= CAP_BUF_SIZE) {
-            // Zero-copy triple-buffer swap: exchange cap_idx with ready_idx
+            // Zero-copy swap: exchange cap_idx with ready_idx
             mutexLock(&ctx->buf_mutex);
             int tmp = ctx->cap_idx;
             ctx->cap_idx = ctx->ready_idx;
             ctx->ready_idx = tmp;
             ctx->ready_size = out_size;
             ctx->frame_seq++;
+            ctx->ready_seq = ctx->frame_seq;
             condvarWakeAll(&ctx->frame_cv);
             mutexUnlock(&ctx->buf_mutex);
 

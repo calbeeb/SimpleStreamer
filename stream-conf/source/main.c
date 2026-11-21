@@ -5,6 +5,29 @@
 #include <switch.h>
 #include "config.h"
 
+static const char* usb_speed_name(u8 sp) {
+    switch (sp) {
+        case 1:  return "Low";
+        case 2:  return "Full-12M";
+        case 3:  return "High-480M";
+        case 4:  return "Super-5G";
+        default: return "None";
+    }
+}
+
+static const char* usb_state_name(u8 st) {
+    switch (st) {
+        case 0:  return "Detached";
+        case 1:  return "Attached";
+        case 2:  return "Powered";
+        case 3:  return "Default";
+        case 4:  return "Address";
+        case 5:  return "Configured";
+        case 6:  return "Suspended";
+        default: return "Unknown";
+    }
+}
+
 int main(int argc, char* argv[]) {
     (void)argc;
     (void)argv;
@@ -52,11 +75,11 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        // [B] Toggle network streaming on/off (Cmd 3)
+        // [B] Toggle streaming on/off (Cmd 3)
         if ((kDown & HidNpadButton_B) && connected) {
             Result togRc = serviceDispatch(&pluginSrv, 3);
             if (R_SUCCEEDED(togRc)) {
-                snprintf(statusMsg, sizeof(statusMsg), "Toggled network streaming.");
+                snprintf(statusMsg, sizeof(statusMsg), "Toggled streaming.");
             } else {
                 snprintf(statusMsg, sizeof(statusMsg), "Toggle failed: 0x%x", togRc);
             }
@@ -69,6 +92,16 @@ int main(int argc, char* argv[]) {
                 snprintf(statusMsg, sizeof(statusMsg), "Toggled audio streaming.");
             } else {
                 snprintf(statusMsg, sizeof(statusMsg), "Audio toggle failed: 0x%x", audRc);
+            }
+        }
+
+        // [L] Toggle USB device mode on/off (Cmd 5)
+        if ((kDown & HidNpadButton_L) && connected) {
+            Result usbRc = serviceDispatch(&pluginSrv, 5);
+            if (R_SUCCEEDED(usbRc)) {
+                snprintf(statusMsg, sizeof(statusMsg), "Toggled USB streaming.");
+            } else {
+                snprintf(statusMsg, sizeof(statusMsg), "USB toggle failed: 0x%x", usbRc);
             }
         }
 
@@ -109,30 +142,52 @@ int main(int argc, char* argv[]) {
         printf("Plugin IPC:  %s (open_rc: 0x%x)\n", connected ? "CONNECTED" : "DISCONNECTED", openRc);
 
         if (connected) {
-            printf("Capture:     %s (caps2:s rc: 0x%x)\n", st.running ? "ACTIVE (Auto 1080p/720p JPEG)" : "IDLE / ERROR", st.last_rc);
-            printf("Live Speed:  %.2f FPS (Capture) | %.2f FPS (Net TX)\n",
+            bool running      = (st.flags & STATUS_FLAG_RUNNING) != 0;
+            bool stream_en    = (st.flags & STATUS_FLAG_STREAMING_ENABLED) != 0;
+            bool tcp_conn     = (st.flags & STATUS_FLAG_CLIENT_CONNECTED) != 0;
+            bool net_listen   = (st.flags & STATUS_FLAG_NET_LISTENING) != 0;
+            bool aud_listen   = (st.flags & STATUS_FLAG_AUDIO_LISTENING) != 0;
+            bool aud_en       = (st.flags & STATUS_FLAG_AUDIO_ENABLED) != 0;
+            bool aud_conn     = (st.flags & STATUS_FLAG_AUDIO_CLIENT_CONNECTED) != 0;
+            bool usb_en       = (st.flags & STATUS_FLAG_USB_ENABLED) != 0;
+            bool usb_active   = (st.flags & STATUS_FLAG_USB_ACTIVE) != 0;
+            bool usb_conn     = (st.flags & STATUS_FLAG_USB_CLIENT_CONNECTED) != 0;
+
+            printf("Capture:     %s (caps2:s rc: 0x%x)\n", running ? "ACTIVE (Auto 1080p/720p JPEG)" : "IDLE / ERROR", st.last_rc);
+            printf("Live Speed:  %.2f FPS (Cap) | %.2f FPS (TCP) | %.2f FPS (USB)\n",
                    (double)st.avg_fps_x100 / 100.0,
-                   (double)st.net_fps_x100 / 100.0);
-            printf("Frames:      %lu\n", st.frames_captured);
-            printf("Frame Size:  %lu bytes (%.1f KB)\n", st.last_frame_size, (double)st.last_frame_size / 1024.0);
-            printf("TCP Server:  %s (Port %u)\n", st.net_listening ? "LISTENING" : "NOT BOUND / FAILED", st.stream_port ? st.stream_port : 8080);
-            printf("Audio TCP:   %s (Port 8081 | %s | %s | rc: 0x%x)\n",
-                   st.audio_listening ? "LISTENING" : "OFF / FAILED",
-                   st.audio_enabled ? "ENABLED" : "PAUSED",
-                   st.audio_client_connected ? "PC CONNECTED" : "WAITING",
+                   (double)st.net_fps_x100 / 100.0,
+                   (double)st.usb_fps_x100 / 100.0);
+            printf("Frames:      %lu | Size: %lu bytes (%.1f KB)\n",
+                   st.frames_captured, st.last_frame_size, (double)st.last_frame_size / 1024.0);
+            printf("TCP Server:  %s (Port %u | Viewer: %s)\n",
+                   net_listen ? "LISTENING" : "OFF",
+                   st.stream_port ? st.stream_port : 8080,
+                   tcp_conn ? "CONNECTED" : "WAITING");
+            printf("Audio:       %s (TCP 8081 %s/%s | rc: 0x%x)\n",
+                   aud_en ? "ENABLED" : "PAUSED",
+                   aud_listen ? "ON" : "OFF",
+                   aud_conn ? "CONNECTED" : "WAITING",
                    st.audio_last_rc);
-            printf("\nConnect CMD: python cv2-client.py %s\n", ipStr);
-            printf("Net Stream:  %s | Viewer: %s\n",
-                   st.streaming_enabled ? "ENABLED" : "PAUSED",
-                   st.client_connected ? "PC CONNECTED" : "WAITING FOR PC");
+            printf("USB (Bot-C): %s | %s (%s/%s | Viewer: %s | rc: 0x%x)\n",
+                   usb_en ? "ENABLED" : "DISABLED",
+                   usb_active ? "ACTIVE" : "OFF",
+                   usb_state_name(st.usb_state),
+                   usb_speed_name(st.usb_speed),
+                   usb_conn ? "CONNECTED" : "WAITING",
+                   st.usb_last_rc);
+            printf("\nWi-Fi CMD:   python cv2-client.py %s\n", ipStr);
+            printf("USB CMD:     python cv2-client.py --usb\n");
+            printf("Stream:      %s\n", stream_en ? "ENABLED" : "PAUSED");
         }
 
         printf("\n---------------------------------------\n");
         printf("Last Action: %s\n", statusMsg);
         printf("---------------------------------------\n\n");
         printf("[A] Save Frame to SD (sdmc:/kaihen_caps2s_frame.jpg)\n");
-        printf("[B] Toggle Network Stream ON/OFF\n");
-        printf("[R] Toggle Audio Stream ON/OFF\n");
+        printf("[B] Toggle Streaming ON/OFF\n");
+        printf("[L] Toggle USB Mode ON/OFF (disable for Album USB copy)\n");
+        printf("[R] Toggle Audio ON/OFF\n");
         printf("[X] Stop Background Plugin\n");
         printf("[Y] Reconnect to Plugin\n");
         printf("[+] Exit Config (keeps background stream running)\n");

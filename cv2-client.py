@@ -7,13 +7,19 @@ import time
 import cv2
 import numpy as np
 
+from usb_transport import UsbDriverError, UsbNotFoundError, open_usb_stream
+
 args = [a for a in sys.argv[1:] if not a.startswith("--")]
 NO_AUDIO = "--no-audio" in sys.argv[1:]
+USE_USB = "--usb" in sys.argv[1:]
 
-if len(args) > 0:
+if USE_USB:
+    SWITCH_IP = None
+elif len(args) > 0:
     SWITCH_IP = args[0]
 else:
-    raise ValueError("Please provide the console's IP address (shown in stream-conf.nro)")
+    raise ValueError("Provide the console's IP address (e.g. 'python cv2-client.py 192.168.x.x') or pass '--usb'")
+
 PORT = 8080
 AUDIO_PORT = 8081
 HDR_FMT = "<II"
@@ -38,10 +44,80 @@ def recv_into_exact(sock, view, n):
         pos += nbytes
 
 
-class StreamReceiver:
-    def __init__(self, ip, port):
-        self.ip = ip
-        self.port = port
+class AudioPlayer:
+    def __init__(self):
+        self.muted = False
+        self.volume = 100
+        self.proc = None
+        self.missing_ffplay = False
+        self._lock = threading.Lock()
+        self._silence = bytes(MAX_AUDIO_PKT)
+
+    def adjust_volume(self, delta):
+        self.volume = max(0, min(100, self.volume + delta))
+        return self.volume
+
+    def _ensure_proc(self):
+        with self._lock:
+            if self.missing_ffplay:
+                return None
+            if self.proc is not None and self.proc.poll() is None:
+                return self.proc
+            try:
+                self.proc = subprocess.Popen(
+                    ["ffplay", "-nodisp", "-loglevel", "error",
+                     "-f", "s16le", "-ar", "48000", "-ac", "2",
+                     "-fflags", "nobuffer", "-flags", "low_delay",
+                     "-probesize", "32", "-analyzeduration", "0", "-i", "-"],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                return self.proc
+            except FileNotFoundError:
+                print("\n[Audio] ffplay not found in PATH; continuing with video only.", flush=True)
+                self.missing_ffplay = True
+                return None
+
+    def feed(self, pcm_view, pkt_size):
+        p = self._ensure_proc()
+        if p is None:
+            return False
+        vol = self.volume
+        if self.muted or vol <= 0:
+            out = self._silence[:pkt_size]
+        elif vol >= 100:
+            out = pcm_view[:pkt_size]
+        else:
+            samples = np.frombuffer(pcm_view[:pkt_size], dtype=np.int16)
+            out = ((samples.astype(np.int32) * vol) // 100).astype(np.int16).tobytes()
+        try:
+            p.stdin.write(out)
+            p.stdin.flush()
+            return True
+        except (BrokenPipeError, OSError):
+            self.stop()
+            return False
+
+    def stop(self):
+        with self._lock:
+            p = self.proc
+            self.proc = None
+        if p is not None:
+            try:
+                if p.stdin:
+                    p.stdin.close()
+            except Exception:
+                pass
+            if p.poll() is None:
+                try:
+                    p.terminate()
+                except Exception:
+                    pass
+
+
+class BaseVideoReceiver:
+    def __init__(self):
         self.running = True
         self.connected = False
         self.attempt = 0
@@ -62,6 +138,45 @@ class StreamReceiver:
         self.net_bytes = 0
         self.last_frame_size = 0
 
+    def _publish_frame(self, w_idx, frame_size):
+        with self.lock:
+            self.write_idx, self.ready_idx = self.ready_idx, w_idx
+            self.ready_size = frame_size
+            self.frame_seq += 1
+            self.net_frames += 1
+            self.net_bytes += frame_size
+            self.last_frame_size = frame_size
+        self.frame_event.set()
+
+    def get_latest_frame(self, last_seq):
+        with self.lock:
+            if self.frame_seq == last_seq or self.ready_size == 0:
+                return None, 0, last_seq
+            self.read_idx, self.ready_idx = self.ready_idx, self.read_idx
+            size = self.ready_size
+            seq = self.frame_seq
+            buf = self.views[self.read_idx][:size]
+        return buf, size, seq
+
+    def pop_stats(self):
+        with self.lock:
+            nf = self.net_frames
+            nb = self.net_bytes
+            lfs = self.last_frame_size
+            self.net_frames = 0
+            self.net_bytes = 0
+        return nf, nb, lfs
+
+    def stop(self):
+        self.running = False
+        self.frame_event.set()
+
+
+class StreamReceiver(BaseVideoReceiver):
+    def __init__(self, ip, port):
+        super().__init__()
+        self.ip = ip
+        self.port = port
         self.thread = threading.Thread(target=self._worker, daemon=True)
         self.thread.start()
 
@@ -105,15 +220,7 @@ class StreamReceiver:
 
                     w_idx = self.write_idx
                     recv_into_exact(sock, self.views[w_idx], frame_size)
-
-                    with self.lock:
-                        self.write_idx, self.ready_idx = self.ready_idx, w_idx
-                        self.ready_size = frame_size
-                        self.frame_seq += 1
-                        self.net_frames += 1
-                        self.net_bytes += frame_size
-                        self.last_frame_size = frame_size
-                    self.frame_event.set()
+                    self._publish_frame(w_idx, frame_size)
             except (ConnectionResetError, ConnectionError, OSError, socket.timeout) as e:
                 if self.running:
                     print(f"\n[Connection interrupted: {e}. Reconnecting...]", flush=True)
@@ -125,89 +232,116 @@ class StreamReceiver:
                 except Exception:
                     pass
 
-    def get_latest_frame(self, last_seq):
-        with self.lock:
-            if self.frame_seq == last_seq or self.ready_size == 0:
-                return None, 0, last_seq
-            self.read_idx, self.ready_idx = self.ready_idx, self.read_idx
-            size = self.ready_size
-            seq = self.frame_seq
-            buf = self.views[self.read_idx][:size]
-        return buf, size, seq
 
-    def pop_stats(self):
-        with self.lock:
-            nf = self.net_frames
-            nb = self.net_bytes
-            lfs = self.last_frame_size
-            self.net_frames = 0
-            self.net_bytes = 0
-        return nf, nb, lfs
-
-    def stop(self):
-        self.running = False
-        self.frame_event.set()
-
-
-class AudioReceiver:
-    def __init__(self, ip, port):
-        self.ip = ip
-        self.port = port
-        self.running = True
-        self.connected = False
-        self.muted = False
-        self.volume = 100
-        self.proc = None
-        self._proc_lock = threading.Lock()
+class UsbStreamReceiver(BaseVideoReceiver):
+    def __init__(self, audio_player):
+        super().__init__()
+        self.audio_player = audio_player
+        self._dev_lock = threading.Lock()
+        self._dev = None
         self.thread = threading.Thread(target=self._worker, daemon=True)
         self.thread.start()
 
-    def adjust_volume(self, delta):
-        self.volume = max(0, min(100, self.volume + delta))
-        return self.volume
+    def _worker(self):
+        hdr_buf = bytearray(HDR_SIZE)
+        pcm_buf = bytearray(MAX_AUDIO_PKT)
+        pcm_view = memoryview(pcm_buf)
+        want_audio = self.audio_player is not None
 
-    def _start_player(self):
-        with self._proc_lock:
-            if self.proc is not None and self.proc.poll() is None:
-                return self.proc
-            try:
-                self.proc = subprocess.Popen(
-                    ["ffplay", "-nodisp", "-loglevel", "error",
-                     "-f", "s16le", "-ar", "48000", "-ac", "2",
-                     "-fflags", "nobuffer", "-flags", "low_delay",
-                     "-probesize", "32", "-analyzeduration", "0", "-i", "-"],
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-                return self.proc
-            except FileNotFoundError:
-                print("\n[Audio] ffplay not found in PATH; continuing with video only.", flush=True)
-                self.running = False
-                return None
+        while self.running:
+            dev = None
+            self.attempt = 0
+            last_driver_warn = 0.0
+            while self.running and dev is None:
+                self.attempt += 1
+                try:
+                    if self.attempt == 1:
+                        print("Connecting to Switch 2 over USB (bottom USB-C)...", end="", flush=True)
+                    else:
+                        print(".", end="", flush=True)
+                    dev = open_usb_stream(want_video=True, want_audio=want_audio, timeout_ms=3000)
+                    with self._dev_lock:
+                        self._dev = dev
+                    self.connected = True
+                    print(f" Connected! (maxPkt={dev.max_pkt_in}B) [Attempt {self.attempt}]", flush=True)
+                except UsbDriverError as e:
+                    now = time.time()
+                    if now - last_driver_warn >= 5.0:
+                        print(f"\n[USB Driver] {e}", flush=True)
+                        last_driver_warn = now
+                    time.sleep(0.5)
+                except (UsbNotFoundError, Exception):
+                    time.sleep(0.5)
 
-    def _stop_player(self):
-        with self._proc_lock:
-            p = self.proc
-            self.proc = None
-        if p is not None:
+            if not self.running or dev is None:
+                break
+
             try:
-                if p.stdin:
-                    p.stdin.close()
+                while self.running:
+                    dev.read_into_exact(hdr_buf, HDR_SIZE)
+                    magic, payload_size = struct.unpack(HDR_FMT, hdr_buf)
+
+                    if magic == STREAM_MAGIC:
+                        if payload_size == 0 or payload_size > MAX_FRAME_SIZE:
+                            print(f"\n[USB invalid video size={payload_size}]", flush=True)
+                            break
+                        w_idx = self.write_idx
+                        dev.read_into_exact(self.bufs[w_idx], payload_size)
+                        self._publish_frame(w_idx, payload_size)
+                    elif magic == AUDIO_MAGIC:
+                        if payload_size == 0 or payload_size > MAX_AUDIO_PKT:
+                            print(f"\n[USB invalid audio size={payload_size}]", flush=True)
+                            break
+                        dev.read_into_exact(pcm_buf, payload_size)
+                        if self.audio_player is not None:
+                            self.audio_player.feed(pcm_view, payload_size)
+                    else:
+                        print(f"\n[USB sync lost: magic=0x{magic:08x}, size={payload_size}]", flush=True)
+                        break
+            except (ConnectionResetError, ConnectionError, OSError) as e:
+                if self.running:
+                    print(f"\n[USB interrupted: {e}. Reconnecting...]", flush=True)
+            finally:
+                self.connected = False
+                self.frame_event.set()
+                if self.audio_player is not None:
+                    self.audio_player.stop()
+                with self._dev_lock:
+                    d = self._dev
+                    self._dev = None
+                if d is not None:
+                    try:
+                        d.close(send_stop=not self.running)
+                    except Exception:
+                        pass
+
+    def stop(self):
+        super().stop()
+        with self._dev_lock:
+            d = self._dev
+            self._dev = None
+        if d is not None:
+            try:
+                d.close(send_stop=True)
             except Exception:
                 pass
-            if p.poll() is None:
-                try:
-                    p.terminate()
-                except Exception:
-                    pass
+
+
+class TcpAudioReceiver:
+    def __init__(self, ip, port, audio_player):
+        self.ip = ip
+        self.port = port
+        self.audio_player = audio_player
+        self.running = True
+        self.connected = False
+        self.thread = threading.Thread(target=self._worker, daemon=True)
+        self.thread.start()
 
     def _worker(self):
         hdr_buf = bytearray(HDR_SIZE)
         hdr_view = memoryview(hdr_buf)
         pcm_buf = bytearray(MAX_AUDIO_PKT)
         pcm_view = memoryview(pcm_buf)
-        silence = bytes(MAX_AUDIO_PKT)
 
         while self.running:
             sock = None
@@ -228,36 +362,22 @@ class AudioReceiver:
             if not self.running or sock is None:
                 break
 
-            player = self._start_player()
-            if player is None:
-                try:
-                    sock.close()
-                except Exception:
-                    pass
-                break
-
             try:
-                while self.running and player.poll() is None:
+                while self.running:
                     recv_into_exact(sock, hdr_view, HDR_SIZE)
                     magic, pkt_size = struct.unpack(HDR_FMT, hdr_buf)
                     if magic != AUDIO_MAGIC or pkt_size == 0 or pkt_size > MAX_AUDIO_PKT:
                         break
                     recv_into_exact(sock, pcm_view, pkt_size)
-                    vol = self.volume
-                    if self.muted or vol <= 0:
-                        out = silence[:pkt_size]
-                    elif vol >= 100:
-                        out = pcm_view[:pkt_size]
-                    else:
-                        samples = np.frombuffer(pcm_view[:pkt_size], dtype=np.int16)
-                        out = ((samples.astype(np.int32) * vol) // 100).astype(np.int16).tobytes()
-                    player.stdin.write(out)
-                    player.stdin.flush()
+                    if not self.audio_player.feed(pcm_view, pkt_size):
+                        if self.audio_player.missing_ffplay:
+                            self.running = False
+                        break
             except (ConnectionResetError, ConnectionError, BrokenPipeError, OSError, socket.timeout):
                 pass
             finally:
                 self.connected = False
-                self._stop_player()
+                self.audio_player.stop()
                 try:
                     sock.close()
                 except Exception:
@@ -265,48 +385,58 @@ class AudioReceiver:
 
     def stop(self):
         self.running = False
-        self._stop_player()
+        self.audio_player.stop()
 
 
-def format_audio_title(audio_rx):
-    if audio_rx is None:
+def format_audio_title(audio_player):
+    if audio_player is None:
         return "Audio: OFF"
-    if audio_rx.muted:
-        return f"Vol: {audio_rx.volume}% (MUTED)"
-    return f"Vol: {audio_rx.volume}%"
+    if audio_player.muted:
+        return f"Vol: {audio_player.volume}% (MUTED)"
+    return f"Vol: {audio_player.volume}%"
 
 
 def main():
+    target_desc = "USB (bottom USB-C, 1209:BEEB)" if USE_USB else f"{SWITCH_IP}:{PORT}"
+    audio_desc = "OFF" if NO_AUDIO else ("USB muxed" if USE_USB else f"port {AUDIO_PORT}")
     print("==================================================", flush=True)
     print("   Switch 2 Async Live Stream Client (Multi-Thr)  ", flush=True)
     print("==================================================", flush=True)
-    print(f"Target Switch IP: {SWITCH_IP}:{PORT} (Audio: {'OFF' if NO_AUDIO else f'port {AUDIO_PORT}'})")
+    print(f"Target: {target_desc} (Audio: {audio_desc})")
     print("Controls: [ESC / Q] Quit | [H] Half-Scale | [M] Mute | [Up/Down] Volume +-5%\n", flush=True)
 
     win_name = "Switch 2 Stream"
     cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(win_name, 1280, 720)
 
-    receiver = StreamReceiver(SWITCH_IP, PORT)
-    audio_rx = None if NO_AUDIO else AudioReceiver(SWITCH_IP, AUDIO_PORT)
+    audio_player = None if NO_AUDIO else AudioPlayer()
+    tcp_audio_rx = None
+    if USE_USB:
+        receiver = UsbStreamReceiver(audio_player)
+    else:
+        receiver = StreamReceiver(SWITCH_IP, PORT)
+        if audio_player is not None:
+            tcp_audio_rx = TcpAudioReceiver(SWITCH_IP, AUDIO_PORT, audio_player)
+
     last_img = None
     last_seq = 0
     half_scale = False
-    base_title = "Switch 2 Stream"
+    mode_tag = "USB" if USE_USB else "Wi-Fi"
+    base_title = f"Switch 2 Stream ({mode_tag})"
 
     def update_title():
-        cv2.setWindowTitle(win_name, f"{base_title} | {format_audio_title(audio_rx)}")
+        cv2.setWindowTitle(win_name, f"{base_title} | {format_audio_title(audio_player)}")
 
     def handle_key(key):
         nonlocal half_scale
         if key == -1:
             return False
-        if key in KEY_UP_CODES and audio_rx is not None:
-            audio_rx.adjust_volume(VOLUME_STEP)
+        if key in KEY_UP_CODES and audio_player is not None:
+            audio_player.adjust_volume(VOLUME_STEP)
             update_title()
             return False
-        if key in KEY_DOWN_CODES and audio_rx is not None:
-            audio_rx.adjust_volume(-VOLUME_STEP)
+        if key in KEY_DOWN_CODES and audio_player is not None:
+            audio_player.adjust_volume(-VOLUME_STEP)
             update_title()
             return False
         if 0 <= key < 256:
@@ -316,8 +446,8 @@ def main():
             if key in (ord('h'), ord('H')):
                 half_scale = not half_scale
                 print(f"\n[Fast Half-Scale Decode: {'ON (960x540)' if half_scale else 'OFF (1920x1080)'}]", flush=True)
-            elif key in (ord('m'), ord('M')) and audio_rx is not None:
-                audio_rx.muted = not audio_rx.muted
+            elif key in (ord('m'), ord('M')) and audio_player is not None:
+                audio_player.muted = not audio_player.muted
                 update_title()
         return False
 
@@ -325,6 +455,7 @@ def main():
 
     stat_time = time.time()
     disp_frames = 0
+    wait_label = "Switch 2 over USB (bottom port)" if USE_USB else f"Switch 2 ({SWITCH_IP}:{PORT})"
 
     try:
         while receiver.running:
@@ -338,12 +469,12 @@ def main():
                     overlay = display.copy()
                     cv2.rectangle(overlay, (0, 0), (w, 60), (20, 20, 20), -1)
                     cv2.addWeighted(overlay, 0.75, display, 0.25, 0, display)
-                    cv2.putText(display, f"Connecting to Switch 2 ({SWITCH_IP}:{PORT})...", (20, 40),
+                    cv2.putText(display, f"Connecting to {wait_label}...", (20, 40),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 215, 255), 2, cv2.LINE_AA)
                     cv2.imshow(win_name, display)
                 else:
                     blank = np.zeros((720, 1280, 3), dtype=np.uint8)
-                    cv2.putText(blank, f"Waiting for Switch 2 at {SWITCH_IP}:{PORT}...", (160, 360),
+                    cv2.putText(blank, f"Waiting for {wait_label}...", (140, 360),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.95, (220, 220, 220), 2, cv2.LINE_AA)
                     cv2.imshow(win_name, blank)
 
@@ -370,9 +501,9 @@ def main():
                 disp_fps = disp_frames / elapsed
                 mbps = (net_b * 8) / (elapsed * 1_000_000)
                 res_str = f"{last_img.shape[1]}x{last_img.shape[0]}" if last_img is not None else ""
-                base_title = f"Switch 2 Stream - {res_str} @ Net {net_fps:.1f} / Disp {disp_fps:.1f} FPS ({last_fs / 1024:.0f} KB, {mbps:.1f} Mbps)"
+                base_title = f"Switch 2 Stream ({mode_tag}) - {res_str} @ {net_fps:.1f} / Disp {disp_fps:.1f} FPS ({last_fs / 1024:.0f} KB, {mbps:.1f} Mbps)"
                 update_title()
-                print(f"PC Receiver: Net {net_fps:.1f} FPS | Disp {disp_fps:.1f} FPS | Frame: {last_fs / 1024:.1f} KB | Bitrate: {mbps:.1f} Mbps | Res: {res_str}", flush=True)
+                print(f"PC Receiver ({mode_tag}): Rx {net_fps:.1f} FPS | Disp {disp_fps:.1f} FPS | Frame: {last_fs / 1024:.1f} KB | Bitrate: {mbps:.1f} Mbps | Res: {res_str}", flush=True)
                 disp_frames = 0
                 stat_time = now
 
@@ -380,8 +511,10 @@ def main():
                 break
     finally:
         receiver.stop()
-        if audio_rx is not None:
-            audio_rx.stop()
+        if tcp_audio_rx is not None:
+            tcp_audio_rx.stop()
+        if audio_player is not None:
+            audio_player.stop()
         cv2.destroyAllWindows()
         print("Stream viewer closed.", flush=True)
 

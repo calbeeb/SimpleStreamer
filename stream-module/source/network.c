@@ -4,14 +4,13 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include "stream.h"
-
-#define STREAM_MAGIC 0x5357324A // "SW2J"
 
 typedef struct __attribute__((packed)) {
     u32 magic;      // 0x5357324A
@@ -56,57 +55,136 @@ static bool send_all(int fd, const void* data, size_t len) {
     return true;
 }
 
-void network_thread_func(void* arg) {
-    CaptureContext* ctx = (CaptureContext*)arg;
+static u32 query_current_ip(CaptureContext* ctx) {
+    if (!atomic_load(&ctx->nifm_inited)) return 1; // fallback: assume link up if nifm unavailable
+    u32 ip = 0;
+    if (R_FAILED(nifmGetCurrentIpAddress(&ip))) {
+        return 0;
+    }
+    return ip;
+}
 
-    stream_write_log("network_thread_func started.");
-
-    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd < 0) {
+static int create_tcp_listener(u16 port, const char* tag) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
         char err_msg[128];
-        snprintf(err_msg, sizeof(err_msg), "TCP socket() failed: errno=%d", errno);
+        snprintf(err_msg, sizeof(err_msg), "%s socket() failed: errno=%d", tag, errno);
         stream_write_log(err_msg);
-        return;
+        return -1;
     }
 
     int reuse = 1;
-    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
 
-    // Non-blocking so accept() doesn't block shutdown
-    int flags = fcntl(server_fd, F_GETFL, 0);
-    fcntl(server_fd, F_SETFL, flags | O_NONBLOCK);
+    int flags = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 
     // Important: Do NOT set sin_len. Horizon OS BSD expects standard { sin_family = AF_INET }
     struct sockaddr_in bind_addr = {0};
     bind_addr.sin_family = AF_INET;
     bind_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    bind_addr.sin_port = htons(STREAM_PORT);
+    bind_addr.sin_port = htons(port);
 
-    if (bind(server_fd, (struct sockaddr*)&bind_addr, sizeof(bind_addr)) < 0) {
+    if (bind(fd, (struct sockaddr*)&bind_addr, sizeof(bind_addr)) < 0) {
         char err_msg[128];
-        snprintf(err_msg, sizeof(err_msg), "TCP bind() failed on port %d: errno=%d", STREAM_PORT, errno);
+        snprintf(err_msg, sizeof(err_msg), "%s bind() failed on port %u: errno=%d", tag, port, errno);
         stream_write_log(err_msg);
-        close(server_fd);
-        return;
+        close(fd);
+        return -1;
     }
 
-    if (listen(server_fd, 1) < 0) {
+    if (listen(fd, 1) < 0) {
         char err_msg[128];
-        snprintf(err_msg, sizeof(err_msg), "TCP listen() failed: errno=%d", errno);
+        snprintf(err_msg, sizeof(err_msg), "%s listen() failed: errno=%d", tag, errno);
         stream_write_log(err_msg);
-        close(server_fd);
-        return;
+        close(fd);
+        return -1;
     }
 
-    ctx->listen_fd = server_fd;
-    atomic_store(&ctx->net_listening, true);
-    stream_write_log("TCP low-latency JPEG streamer listening on port 8080.");
+    return fd;
+}
+
+void network_thread_func(void* arg) {
+    CaptureContext* ctx = (CaptureContext*)arg;
+
+    stream_write_log("network_thread_func started.");
+
+    int server_fd = -1;
+    u32 bound_ip = 0;
+    u64 last_link_check = 0;
 
     while (!atomic_load(&ctx->stop_requested)) {
+        u64 now_tick = armGetSystemTick();
+
+        // Periodically check Wi-Fi/network link & listener health (handles Sleep -> Wake recovery)
+        if (server_fd < 0 || armTicksToNs(now_tick - last_link_check) >= 1000000000ULL) {
+            last_link_check = now_tick;
+            u32 cur_ip = query_current_ip(ctx);
+
+            bool need_rebind = false;
+            if (server_fd >= 0) {
+                struct pollfd pfd = { .fd = server_fd, .events = POLLIN };
+                int pr = poll(&pfd, 1, 0);
+                if (pr < 0 || (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))) {
+                    char msg[128];
+                    snprintf(msg, sizeof(msg), "TCP listener invalidated (poll=%d revents=0x%x); rebinding...",
+                             pr, pfd.revents);
+                    stream_write_log(msg);
+                    need_rebind = true;
+                } else if (cur_ip == 0 || cur_ip != bound_ip) {
+                    char msg[128];
+                    snprintf(msg, sizeof(msg), "TCP network changed (ip 0x%x -> 0x%x); resetting listener.",
+                             bound_ip, cur_ip);
+                    stream_write_log(msg);
+                    need_rebind = true;
+                }
+            }
+
+            if (need_rebind && server_fd >= 0) {
+                close(server_fd);
+                server_fd = -1;
+                ctx->listen_fd = -1;
+                bound_ip = 0;
+                atomic_store(&ctx->net_listening, false);
+            }
+
+            if (server_fd < 0 && cur_ip != 0) {
+                server_fd = create_tcp_listener(STREAM_PORT, "TCP");
+                if (server_fd >= 0) {
+                    ctx->listen_fd = server_fd;
+                    bound_ip = cur_ip;
+                    atomic_store(&ctx->net_listening, true);
+                    stream_write_log("TCP low-latency JPEG streamer listening on port 8080.");
+                } else {
+                    svcSleepThread(500000000ULL);
+                    continue;
+                }
+            }
+        }
+
+        if (server_fd < 0) {
+            svcSleepThread(200000000ULL);
+            continue;
+        }
+
         struct sockaddr_in client_addr = {0};
         socklen_t client_len = sizeof(client_addr);
         int client_fd = accept(server_fd, (struct sockaddr*)&client_addr, &client_len);
         if (client_fd < 0) {
+            int err = errno;
+            if (err != EAGAIN && err != EWOULDBLOCK && err != EINTR) {
+                char msg[128];
+                snprintf(msg, sizeof(msg), "TCP accept() error (errno=%d, bsd_rc=0x%x); rebinding listener.",
+                         err, socketGetLastResult());
+                stream_write_log(msg);
+                close(server_fd);
+                server_fd = -1;
+                ctx->listen_fd = -1;
+                bound_ip = 0;
+                atomic_store(&ctx->net_listening, false);
+                svcSleepThread(250000000ULL);
+                continue;
+            }
             svcSleepThread(50000000ULL); // 50 ms idle sleep waiting for client
             continue;
         }
@@ -142,14 +220,14 @@ void network_thread_func(void* arg) {
             mutexLock(&ctx->buf_mutex);
             while (!atomic_load(&ctx->stop_requested) &&
                    atomic_load(&ctx->streaming_enabled) &&
-                   ctx->frame_seq == last_sent_seq) {
+                   ctx->ready_seq <= last_sent_seq) {
                 Result res = condvarWaitTimeout(&ctx->frame_cv, &ctx->buf_mutex, 100000000ULL);
                 if (R_FAILED(res)) {
                     break;
                 }
             }
 
-            if (ctx->frame_seq == last_sent_seq) {
+            if (ctx->ready_seq <= last_sent_seq) {
                 mutexUnlock(&ctx->buf_mutex);
                 continue;
             }
@@ -158,12 +236,21 @@ void network_thread_func(void* arg) {
                 atomic_load(&ctx->streaming_enabled) &&
                 ctx->ready_size > 0 &&
                 ctx->ready_size <= CAP_BUF_SIZE) {
-                // Zero-copy triple-buffer swap: exchange net_idx with ready_idx
-                int tmp = ctx->net_idx;
-                ctx->net_idx = ctx->ready_idx;
-                ctx->ready_idx = tmp;
+                bool usb_also_needs = atomic_load(&ctx->usb_client_connected) &&
+                                      (ctx->usb_last_seq < ctx->ready_seq);
                 frame_size = ctx->ready_size;
-                last_sent_seq = ctx->frame_seq;
+                last_sent_seq = ctx->ready_seq;
+                ctx->net_last_seq = last_sent_seq;
+                if (usb_also_needs) {
+                    // Both TCP and USB viewers are active: copy so USB keeps ready_idx intact
+                    memcpy(ctx->bufs[ctx->net_idx], ctx->bufs[ctx->ready_idx], frame_size);
+                } else {
+                    // Solo consumer: zero-copy buffer swap
+                    int tmp = ctx->net_idx;
+                    ctx->net_idx = ctx->ready_idx;
+                    ctx->ready_idx = tmp;
+                    ctx->ready_seq = 0;
+                }
             }
             mutexUnlock(&ctx->buf_mutex);
 

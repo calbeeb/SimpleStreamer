@@ -5,6 +5,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <poll.h>
 #include <malloc.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -13,14 +14,8 @@
 #include <arpa/inet.h>
 #include "stream.h"
 
-#define AUDIO_STREAM_MAGIC     0x53573241 // "SW2A"
 #define AUDIO_DEVICE_NAME      "ScoopVideo"
 #define AUDIO_FORMAT_Q15       2          // 16-bit signed PCM (s16le)
-#define AUDIO_CHANNELS         2
-#define AUDIO_SAMPLE_RATE      48000
-#define AUDIO_BYTES_PER_SAMPLE 2
-#define AUDIO_FRAME_BYTES      (AUDIO_CHANNELS * AUDIO_BYTES_PER_SAMPLE)
-#define AUDIO_MAX_PKT_FRAMES   1920       // 40 ms max per TCP packet (7680 bytes)
 
 typedef struct __attribute__((packed)) {
     u32 magic;        // 0x53573241 ("SW2A")
@@ -204,22 +199,7 @@ static bool audio_send_all(int fd, const void* data, size_t len) {
     return true;
 }
 
-typedef struct {
-    Service dmg_sess;
-    Service smx_mgr;
-    Service smx_sess;
-    Service smx_stream;
-    Event   ev;
-    bool    has_ev;
-    bool    started;
-    u32     stream_id;
-    u32     ring_frames;
-    u32     ring_slots;
-    u8*     ring_base;
-    size_t  ring_size;
-} AudioCaptureSession;
-
-static void audio_capture_close(AudioCaptureSession* s) {
+void audio_capture_close(AudioCaptureSession* s) {
     if (s->started) {
         auddmg_stop_stream(&s->dmg_sess, s->stream_id);
         s->started = false;
@@ -247,7 +227,7 @@ static void audio_capture_close(AudioCaptureSession* s) {
     s->ring_size = 0;
 }
 
-static Result audio_capture_open(AudioCaptureSession* s) {
+Result audio_capture_open(AudioCaptureSession* s) {
     memset(s, 0, sizeof(*s));
 
     Service dmg_mgr = {0};
@@ -277,8 +257,8 @@ static Result audio_capture_open(AudioCaptureSession* s) {
 
     u32 min_frames = (u32)((min_dur_ns * (u64)AUDIO_SAMPLE_RATE + 999999999ULL) / 1000000000ULL);
     u32 period_frames = (min_frames > 480) ? min_frames : 480; // 10 ms low-latency wakeup
-    u32 ring_frames   = period_frames * 8;                      // 80 ms+ ring headroom
-    if (ring_frames < 4800) ring_frames = 4800;                 // >= 100 ms
+    u32 ring_frames   = period_frames * 16;                     // 160+ ms ring headroom
+    if (ring_frames < 9600) ring_frames = 9600;                 // >= 200 ms
     u32 ring_slots    = ring_frames + 1;
 
     size_t pcm_bytes = ((size_t)ring_slots * AUDIO_FRAME_BYTES + 0x3F) & ~(size_t)0x3F;
@@ -337,63 +317,166 @@ fail:
     return rc;
 }
 
-void audio_thread_func(void* arg) {
-    CaptureContext* ctx = (CaptureContext*)arg;
-    stream_write_log("audio_thread_func started.");
+size_t audio_capture_read_pcm(AudioCaptureSession* s, u8* out_pcm, u32 max_frames, bool* out_error) {
+    if (out_error) *out_error = false;
+    if (!s->started || !s->ring_base) return 0;
 
-    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd < 0) {
-        char msg[128];
-        snprintf(msg, sizeof(msg), "Audio TCP socket() failed: errno=%d", errno);
-        stream_write_log(msg);
-        return;
+    armDCacheFlush(s->ring_base + 0x1000, 0x40);
+    u32 write_idx = *(volatile u32*)(s->ring_base + 0x1004);
+    u8  idle_flag = *(volatile u8* )(s->ring_base + 0x1008);
+    u32 read_idx  = *(volatile u32*)(s->ring_base + 0x0044);
+
+    if (write_idx >= s->ring_slots || read_idx >= s->ring_slots) {
+        if (out_error) *out_error = true;
+        return 0;
+    }
+    if (idle_flag & 1) {
+        return 0;
     }
 
-    int reuse = 1;
-    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+    u32 avail = (write_idx >= read_idx)
+                ? (write_idx - read_idx)
+                : (write_idx + s->ring_slots - read_idx);
+    if (avail == 0) {
+        return 0;
+    }
 
-    int flags = fcntl(server_fd, F_GETFL, 0);
-    fcntl(server_fd, F_SETFL, flags | O_NONBLOCK);
+    u32 take = (avail > max_frames) ? max_frames : avail;
+    u32 first = s->ring_slots - read_idx;
+    if (first > take) first = take;
+    u32 second = take - first;
+
+    u8* pcm_ring = s->ring_base + 0x10C0;
+    size_t copied = 0;
+
+    if (first > 0) {
+        u8* src = pcm_ring + (size_t)read_idx * AUDIO_FRAME_BYTES;
+        size_t bytes = (size_t)first * AUDIO_FRAME_BYTES;
+        armDCacheFlush(src, bytes);
+        memcpy(out_pcm, src, bytes);
+        copied += bytes;
+    }
+    if (second > 0) {
+        size_t bytes = (size_t)second * AUDIO_FRAME_BYTES;
+        armDCacheFlush(pcm_ring, bytes);
+        memcpy(out_pcm + copied, pcm_ring, bytes);
+        copied += bytes;
+    }
+
+    read_idx += take;
+    if (read_idx >= s->ring_slots) read_idx -= s->ring_slots;
+    *(volatile u32*)(s->ring_base + 0x0044) = read_idx;
+    armDCacheFlush(s->ring_base + 0x0040, 0x40);
+
+    return copied;
+}
+
+static u32 audio_query_current_ip(CaptureContext* ctx) {
+    if (!atomic_load(&ctx->nifm_inited)) return 1;
+    u32 ip = 0;
+    if (R_FAILED(nifmGetCurrentIpAddress(&ip))) {
+        return 0;
+    }
+    return ip;
+}
+
+static int audio_create_tcp_listener(u16 port) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+
+    int reuse = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+
+    int flags = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 
     struct sockaddr_in bind_addr = {0};
     bind_addr.sin_family = AF_INET;
     bind_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    bind_addr.sin_port = htons(AUDIO_STREAM_PORT);
+    bind_addr.sin_port = htons(port);
 
-    if (bind(server_fd, (struct sockaddr*)&bind_addr, sizeof(bind_addr)) < 0) {
-        char msg[128];
-        snprintf(msg, sizeof(msg), "Audio TCP bind() failed on port %d: errno=%d", AUDIO_STREAM_PORT, errno);
-        stream_write_log(msg);
-        close(server_fd);
-        return;
+    if (bind(fd, (struct sockaddr*)&bind_addr, sizeof(bind_addr)) < 0) {
+        close(fd);
+        return -1;
     }
-
-    if (listen(server_fd, 1) < 0) {
-        char msg[128];
-        snprintf(msg, sizeof(msg), "Audio TCP listen() failed: errno=%d", errno);
-        stream_write_log(msg);
-        close(server_fd);
-        return;
+    if (listen(fd, 1) < 0) {
+        close(fd);
+        return -1;
     }
+    return fd;
+}
 
-    ctx->audio_listen_fd = server_fd;
-    atomic_store(&ctx->audio_listening, true);
-    stream_write_log("Audio TCP PCM streamer listening on port 8081 (48kHz 16-bit stereo).");
+void audio_thread_func(void* arg) {
+    CaptureContext* ctx = (CaptureContext*)arg;
+    stream_write_log("audio_thread_func started.");
 
     u8* pkt_buf = (u8*)malloc(sizeof(TcpAudioHeader) + AUDIO_MAX_PKT_FRAMES * AUDIO_FRAME_BYTES);
     if (!pkt_buf) {
         stream_write_log("Audio packet buffer alloc failed.");
-        atomic_store(&ctx->audio_listening, false);
-        close(server_fd);
-        ctx->audio_listen_fd = -1;
         return;
     }
 
+    int server_fd = -1;
+    u32 bound_ip = 0;
+    u64 last_link_check = 0;
+
     while (!atomic_load(&ctx->stop_requested)) {
+        u64 now_tick = armGetSystemTick();
+
+        if (server_fd < 0 || armTicksToNs(now_tick - last_link_check) >= 1000000000ULL) {
+            last_link_check = now_tick;
+            u32 cur_ip = audio_query_current_ip(ctx);
+
+            bool need_rebind = false;
+            if (server_fd >= 0) {
+                struct pollfd pfd = { .fd = server_fd, .events = POLLIN };
+                int pr = poll(&pfd, 1, 0);
+                if (pr < 0 || (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) || cur_ip == 0 || cur_ip != bound_ip) {
+                    need_rebind = true;
+                }
+            }
+
+            if (need_rebind && server_fd >= 0) {
+                close(server_fd);
+                server_fd = -1;
+                ctx->audio_listen_fd = -1;
+                bound_ip = 0;
+                atomic_store(&ctx->audio_listening, false);
+            }
+
+            if (server_fd < 0 && cur_ip != 0) {
+                server_fd = audio_create_tcp_listener(AUDIO_STREAM_PORT);
+                if (server_fd >= 0) {
+                    ctx->audio_listen_fd = server_fd;
+                    bound_ip = cur_ip;
+                    atomic_store(&ctx->audio_listening, true);
+                    stream_write_log("Audio TCP PCM streamer listening on port 8081 (48kHz 16-bit stereo).");
+                } else {
+                    svcSleepThread(500000000ULL);
+                    continue;
+                }
+            }
+        }
+
+        if (server_fd < 0) {
+            svcSleepThread(200000000ULL);
+            continue;
+        }
+
         struct sockaddr_in client_addr = {0};
         socklen_t client_len = sizeof(client_addr);
         int client_fd = accept(server_fd, (struct sockaddr*)&client_addr, &client_len);
         if (client_fd < 0) {
+            int err = errno;
+            if (err != EAGAIN && err != EWOULDBLOCK && err != EINTR) {
+                close(server_fd);
+                server_fd = -1;
+                ctx->audio_listen_fd = -1;
+                bound_ip = 0;
+                atomic_store(&ctx->audio_listening, false);
+                svcSleepThread(250000000ULL);
+                continue;
+            }
             svcSleepThread(50000000ULL);
             continue;
         }

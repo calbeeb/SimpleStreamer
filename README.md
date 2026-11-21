@@ -3,19 +3,27 @@
 ## About
 ### Requires a stable & strong network connection, bitrates can exceed *250* Mbps
 
-This repo is a proof of concept for display streaming from a jailbroken Switch 2 to another device. It uses the `caps2:s` service to create a 1080p MJPEG stream targeting 30fps, alongside `auddmg:u` and `audsmx:u` for 48kHz 16-bit stereo audio, and streams both to a client over TCP. It does not reach the 30fps target and it is unlikely it will in the near future.
+This repo is a proof of concept for display streaming from a jailbroken Switch 2 to another device. It uses the `caps2:s` service to create a 1080p MJPEG stream targeting 30fps, alongside `auddmg:u` and `audsmx:u` for 48kHz 16-bit stereo audio, and streams both to a client over TCP or USB. It does not reach the 30fps target and it is unlikely it will in the near future.
 
 This README is human-written, but the code & research behind this project are **significantly AI-assisted**.
 
-Only tested on a v23.0.1 Switch 2 running kurumuz's ns2jb through SmileBASIC 4, and a Windows client.
+Only tested on:
+* a v23.0.1 Switch 2 running kurumuz's ns2jb through SmileBASIC 4
+* the same Switch 2 running rushinz's seedsow-semi-untethered
+* a Windows client
 
 ## Features
 
-* Streams MJPEG over TCP to a connected client
+* Streams MJPEG and stereo audio to a connected client
     * 1920x1080 capture at up to 30fps
+        * Real-world performance ranges from 15-20fps
         * *See more in `Performance details` below*
-* Streams stereo audio over TCP to the same connected client
     * 48kHz & 16-bit, with volume controls
+* Connection via USB or TCP
+  * A client can connect wirelessly to the Switch 2 using TCP, this supports seamlessly swapping between docked and handheld modes. If the Switch 2 is connected to the network via ethernet when docked, swapping from docked to undocked requires the client to be restarted with the new IP provided.
+  * A client can connect over a USB connection to the bottom port whilst in handheld mode. The top USB port or the dock's USB ports cannot be used for this method.
+  * Swapping connection mode does not require restarting the Switch 2!
+    
 * Two client options:
     * The cv2-client is multi-threaded, displays live FPS and bitrate stats in the window title, and includes a half-scale decode toggle.
         * *Toggled with* `H` *, half-scale decode reduces the client output to 960x540. Should improve playback performance if you are bottlenecked by decoding on the client side.*
@@ -25,12 +33,13 @@ Only tested on a v23.0.1 Switch 2 running kurumuz's ns2jb through SmileBASIC 4, 
         * *plugins cannot be restarted without re-running kaiHEN from a fresh boot*
 * Client and host monitoring:
     * Both client players report the received framerate, frame size, and bitrate
-    * `cv2-client.py` also the network FPS (frames received per second), display FPS (frames decoded per second) to identify any bottlenecks in your setup.
+    * `cv2-client.py` also reports the network FPS (frames received per second), display FPS (frames decoded per second) to identify any bottlenecks in your setup.
     * `stream-conf.nro` can show useful information about the `stream-module` plugin and its connection: plugin status, capture status, capture & transmission framerates, client connection status, console IP, etc...
 * Switching apps and visiting the home menu are handled safely
     * The capture method used is not able to function on the home screen or during a game's black boot screen, but deals with these transitions safely to prevent system panics
 * Works in both docked and handheld mode
     * Stream continues without issue when swapping between docked and handheld, and minimal performance is lost when streaming in handheld mode.
+* USB streaming is confirmed to work using a USB 2.0 connection (480Mbps). It has not been tested with USB 3.0+ compatible cables, but should automatically swap to 5Gbps if the Switch 2 can negotiate it.
 
 ## Installation
 
@@ -44,7 +53,7 @@ Make sure you are successfully able to boot into kaiHen before attempting instal
 
 ### Client Installation
 
-Download `cv2-client.py` or `ffplay-client.py` from the latest release
+Download `stream-client.zip` from the latest release, and extract `cv2-client.py`, `ffplay-client.py`, and `usb_transport.py` to the same folder.
 
 ## Usage
 
@@ -69,6 +78,20 @@ For `ffplay-client.py`:
     * Press `m` to mute/unmute the stream. Make sure you've clicked on the terminal first.
 3. Press `Esc` or `q` to quit the stream.
 
+For USB streaming:
+1. Connect the Switch 2's bottom USB-C port to your computer
+  * First time setup requires using [zadig](https://zadig.akeo.ie/) to install the generic driver, see `First-time USB Setup` below for more info.
+2. Both clients and the streamer keep the same usage steps; just replace `<SWITCH2-IP>` in the python command with `--usb`
+
+## First-time USB Setup
+Hardware limitations mean that only the bottom USB-C port can be used, as the top port is host-only.
+As a result, USB streaming is not supported whilst docked.
+
+1. Download and open [zadig](https://zadig.akeo.ie/)
+2. Click Options, and ensure "List All Devices" is ticked
+3. Find "Switch2 Streamer" in the list and select it. The USB ID should be 1209:BEEB
+4. Click "Install Driver" and wait for zadig to announce completion. From there, you're ready to stream.
+
 ## Building
 Only tested on Windows.
 Ensure you have installed [devkitPro](https://devkitpro.org/) and [ounce-devkit](https://github.com/ouncebrew/ounce-devkit) properly.
@@ -78,6 +101,20 @@ Run `make` in `stream-conf/` and `stream-module/` to build the respective `.nro`
 
 ### Powershell
 Run `.\build.ps1` in `stream-conf/` and `stream-module/` to build the respective `.nro` and `.nso`
+
+## Untested Environments
+The following are some environments I have not tested the project in, and would love feedback on! Feel free to reach out to me in the r/switch2hacks discord and let me know how things work out, especially if part of your setup matches anything below.
+
+* USB 3.0 (or higher) connection
+  * I do not have a USB cable that supports transfer speeds higher than USB 2.0 allows, so I can't test whether USB 3.0 transfer speeds result in any performance differences like lower latency.
+* Weaker wireless connection, or ethernet
+  * My current setup has the Switch 2 on an otherwise uncontested 80Mhz 5Ghz Wifi 6 connection, and my client connected to the same network over 2.5Gbe. Data from users running both the Switch 2 and client over ethernet, both over wireless, or either with weaker wireless connections will help build a more representative idea of bandwidth requirements.
+* Different client OS
+  * The client device I was able to use for testing is running Windows 11. I don't have any devices running a different operating system, so I can't 100% confirm compatibility on MacOS for example.
+* Weaker clients
+  * The client device I was able to use for testing has a 7800X3D. I'm aware this is not an average-strength CPU, so more users providing data will help build a more representative idea of performance. 
+* Alternate entrypoints
+  * Civilization 7, etc.
 
 ## Performance Details
 
