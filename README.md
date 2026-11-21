@@ -22,8 +22,7 @@ Only tested on:
 * Connection via USB or TCP
   * A client can connect wirelessly to the Switch 2 using TCP, this supports seamlessly swapping between docked and handheld modes. If the Switch 2 is connected to the network via ethernet when docked, swapping from docked to undocked requires the client to be restarted with the new IP provided.
   * A client can connect over a USB connection to the bottom port whilst in handheld mode. The top USB port or the dock's USB ports cannot be used for this method.
-  * Swapping connection mode does not require restarting the Switch 2!
-    
+  * Swapping connection mode does not require restarting the Switch 2! 
 * Two client options:
     * The cv2-client is multi-threaded, displays live FPS and bitrate stats in the window title, and includes a half-scale decode toggle.
         * *Toggled with* `H` *, half-scale decode reduces the client output to 960x540. Should improve playback performance if you are bottlenecked by decoding on the client side.*
@@ -40,6 +39,15 @@ Only tested on:
 * Works in both docked and handheld mode
     * Stream continues without issue when swapping between docked and handheld, and minimal performance is lost when streaming in handheld mode.
 * USB streaming is confirmed to work using a USB 2.0 connection (480Mbps). It has not been tested with USB 3.0+ compatible cables, but should automatically swap to 5Gbps if the Switch 2 can negotiate it.
+
+## Known Issues
+
+* Using this module disables the ability to take screenshots or record clips with the capture button
+  * Future updates will let the plugin open and close the `caps2:s` service, letting the system's capture functionalities resume properly
+* Poor stream performance
+  * Nintendo removed the services that allowed for an encoded stream of the display to be captured, and the alternative method left has various quirks that result in significantly lowered performance. With current limitations of the exploit itself, as well as of kaiHEN, options like 720p, 60fps, or lower bandwidth are not possible. Expect 15-20fps when games are running.
+* High bandwidth requirement
+ * As mentioned above, this currently cannot be cut down. If you aren't able to get it running well enough over Wi-Fi, try streaming over USB as this should always have enough bandwidth (unavailable whilst docked). 
 
 ## Installation
 
@@ -108,7 +116,7 @@ The following are some environments I have not tested the project in, and would 
 * USB 3.0 (or higher) connection
   * I do not have a USB cable that supports transfer speeds higher than USB 2.0 allows, so I can't test whether USB 3.0 transfer speeds result in any performance differences like lower latency.
 * Weaker wireless connection, or ethernet
-  * My current setup has the Switch 2 on an otherwise uncontested 80Mhz 5Ghz Wifi 6 connection, and my client connected to the same network over 2.5Gbe. Data from users running both the Switch 2 and client over ethernet, both over wireless, or either with weaker wireless connections will help build a more representative idea of bandwidth requirements.
+  * My current setup has the Switch 2 on an otherwise uncontested 80Mhz 5Ghz Wi-Fi 6 connection, and my client connected to the same network over 2.5Gbe. Data from users running both the Switch 2 and client over ethernet, both over wireless, or either with weaker wireless connections will help build a more representative idea of bandwidth requirements.
 * Different client OS
   * The client device I was able to use for testing is running Windows 11. I don't have any devices running a different operating system, so I can't 100% confirm compatibility on MacOS for example.
 * Weaker clients
