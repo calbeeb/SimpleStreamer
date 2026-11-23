@@ -100,7 +100,7 @@ For GUI interface usage on Windows:
   * Toggle half-scale decoding with a button
 5. When you're done streaming, or want to change connection settings, use the provided button to cleanly close the stream. Alternatively, press `Esc` or `q` whilst focused on the stream window to do the same.
 
-Users on all operating systems can also access the GUI through `client-GUI.py` bundled in `stream-client.zip` each release.
+Users on all operating systems can also access the GUI through `client-GUI.py` bundled in `stream-client.zip` each release. [CustomTKinter](https://github.com/TomSchimansky/CustomTkinter) is also required for the GUI.
 
 For direct `cv2-client.py` usage: 
 1. Ensure `opencv-python` is installed
