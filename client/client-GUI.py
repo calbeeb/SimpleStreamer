@@ -1,10 +1,14 @@
 from cv2_client import Cv2Player
 import customtkinter as ctk
-from tkinter import IntVar, PhotoImage
-from sys import platform
+from tkinter import IntVar, PhotoImage, TclError
+import sys
+from os import path, environ
 import re
 
 VERSION = "v0.4"
+
+def resourcePath(relative): # allow for pulling icon.ico, or other ui assets, whether in pyinstaller exe or loose scripts
+    return path.join(environ.get("_MEIPASS2", path.abspath(".")), relative)
 
 class App(ctk.CTk):
     def __init__(self):
@@ -13,7 +17,7 @@ class App(ctk.CTk):
         self.player = None
         self.protocol("WM_DELETE_WINDOW", self._onClose)
         self.title("SimpleStreamer {}".format(VERSION))
-
+        self.setIcon()
 
         self.tabContainer = ctk.CTkTabview(master=self)
         self.tabContainer.pack(padx=20, pady=20)
@@ -215,6 +219,16 @@ class App(ctk.CTk):
         self.endBtn.configure(state="normal")
         self.tabContainer.set("Stream Controls")
         self.after(200, self._watchPlayer)
+
+    def setIcon(self):
+        try:
+            if sys.platform.startswith("win"):
+                self.iconbitmap(resourcePath("icon.ico"))
+            else:
+                self.icon_image = PhotoImage(file=resourcePath("icon.png"))
+                self.iconphoto(True, self.icon_image)
+        except TclError:
+            pass # icon not a core functionality, no reason to care whether user chooses to download it
 
 
 app = App()
