@@ -14,17 +14,6 @@ except ImportError:
 
 from usb_transport import UsbDriverError, UsbNotFoundError, open_usb_stream
 
-args = [a for a in sys.argv[1:] if not a.startswith("--")]
-NO_AUDIO = "--no-audio" in sys.argv[1:]
-USE_USB = "--usb" in sys.argv[1:]
-
-if USE_USB:
-    SWITCH_IP = None
-elif len(args) > 0:
-    SWITCH_IP = args[0]
-else:
-    raise ValueError("Provide the console's IP address (e.g. 'python ffplay-client.py 192.168.x.x') or pass '--usb'")
-
 PORT = 8080
 AUDIO_PORT = 8081
 HDR_FMT = "<II"
@@ -202,16 +191,16 @@ def start_terminal_audio_keys(audio_player, stop_event):
                 ch = msvcrt.getwch()
                 if ch in ("\x00", "\xe0"):
                     code = msvcrt.getwch()
-                    if code == "H":  # Up arrow
+                    if code == "H":
                         audio_player.adjust_volume(VOLUME_STEP)
                         _print_vol()
-                    elif code == "P":  # Down arrow
+                    elif code == "P":
                         audio_player.adjust_volume(-VOLUME_STEP)
                         _print_vol()
                 elif ch in ("m", "M"):
                     audio_player.muted = not audio_player.muted
                     _print_vol()
-                elif ch == "\x03":  # Ctrl+C
+                elif ch == "\x03":
                     stop_event.set()
                     break
         else:
@@ -233,10 +222,10 @@ def start_terminal_audio_keys(audio_player, stop_event):
                             r3, _, _ = select.select([sys.stdin], [], [], 0.02)
                             if r3:
                                 code = sys.stdin.read(1)
-                                if code == "A":  # Up arrow
+                                if code == "A":
                                     audio_player.adjust_volume(VOLUME_STEP)
                                     _print_vol()
-                                elif code == "B":  # Down arrow
+                                elif code == "B":
                                     audio_player.adjust_volume(-VOLUME_STEP)
                                     _print_vol()
                     elif ch in ("m", "M"):
@@ -255,13 +244,24 @@ def launch_ffplay(title):
         ["ffplay", "-f", "mjpeg", "-fflags", "nobuffer", "-flags", "low_delay",
          "-framedrop", "-probesize", "32", "-analyzeduration", "0", "-vf", "setpts=0",
          "-window_title", title, "-i", "-"],
-        stdin=subprocess.PIPE
+        stdin=subprocess.PIPE,
     )
 
 
 def main():
-    target_desc = "USB (bottom USB-C, 1209:BEEB)" if USE_USB else f"{SWITCH_IP}:{PORT}"
-    audio_desc = "OFF" if NO_AUDIO else ("USB muxed" if USE_USB else f"port {AUDIO_PORT}")
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    no_audio = "--no-audio" in sys.argv[1:]
+    use_usb = "--usb" in sys.argv[1:]
+
+    if use_usb:
+        switch_ip = None
+    elif len(args) > 0:
+        switch_ip = args[0]
+    else:
+        raise ValueError("Provide the console's IP address (e.g. 'python ffplay-client.py 192.168.x.x') or pass '--usb'")
+
+    target_desc = "USB (bottom USB-C, 1209:BEEB)" if use_usb else f"{switch_ip}:{PORT}"
+    audio_desc = "OFF" if no_audio else ("USB muxed" if use_usb else f"port {AUDIO_PORT}")
     print("==================================================", flush=True)
     print("     Switch 2 Live Stream Client (FFplay)         ", flush=True)
     print("==================================================", flush=True)
@@ -269,8 +269,8 @@ def main():
     print("Controls: Close ffplay window or Ctrl+C to quit | Terminal [Up/Down] Volume +-5% | [M] Mute\n", flush=True)
 
     ffplay = None
-    audio_player = None if NO_AUDIO else AudioPlayer()
-    tcp_audio_rx = None if (USE_USB or audio_player is None) else TcpAudioReceiver(SWITCH_IP, AUDIO_PORT, audio_player)
+    audio_player = None if no_audio else AudioPlayer()
+    tcp_audio_rx = None if (use_usb or audio_player is None) else TcpAudioReceiver(switch_ip, AUDIO_PORT, audio_player)
     key_stop = threading.Event()
     start_terminal_audio_keys(audio_player, key_stop)
     running = True
@@ -288,16 +288,15 @@ def main():
             attempt = 0
             last_driver_warn = 0.0
 
-            # Reconnection Loop
             while running and not key_stop.is_set() and sock is None and usb_dev is None:
                 attempt += 1
-                if USE_USB:
+                if use_usb:
                     try:
                         if attempt == 1:
                             print("Connecting to Switch 2 over USB (bottom USB-C)...", end="", flush=True)
                         else:
                             print(".", end="", flush=True)
-                        usb_dev = open_usb_stream(want_video=True, want_audio=not NO_AUDIO, timeout_ms=3000)
+                        usb_dev = open_usb_stream(want_video=True, want_audio=not no_audio, timeout_ms=3000)
                         print(f" Connected! (maxPkt={usb_dev.max_pkt_in}B) [Attempt {attempt}]", flush=True)
                     except UsbDriverError as e:
                         now = time.time()
@@ -310,7 +309,7 @@ def main():
                 else:
                     try:
                         if attempt == 1:
-                            print(f"Connecting to Switch 2 ({SWITCH_IP}:{PORT})...", end="", flush=True)
+                            print(f"Connecting to Switch 2 ({switch_ip}:{PORT})...", end="", flush=True)
                         else:
                             print(".", end="", flush=True)
 
@@ -318,7 +317,7 @@ def main():
                         s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                         s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
                         s.settimeout(2.0)
-                        s.connect((SWITCH_IP, PORT))
+                        s.connect((switch_ip, PORT))
                         s.settimeout(10.0)
                         sock = s
                         print(f" Connected! [Attempt {attempt}]", flush=True)
@@ -329,7 +328,7 @@ def main():
                 break
 
             if ffplay is None or ffplay.poll() is not None:
-                title = "Switch 2 Stream (ffplay USB)" if USE_USB else "Switch 2 Stream (ffplay)"
+                title = "Switch 2 Stream (ffplay USB)" if use_usb else "Switch 2 Stream (ffplay)"
                 ffplay = launch_ffplay(title)
 
             stat_time = time.time()
@@ -340,7 +339,7 @@ def main():
             try:
                 while running and not key_stop.is_set() and ffplay.poll() is None:
                     try:
-                        if USE_USB:
+                        if use_usb:
                             usb_dev.read_into_exact(hdr_buf, HDR_SIZE)
                         else:
                             recv_into_exact(sock, hdr_view, HDR_SIZE)
@@ -350,7 +349,7 @@ def main():
 
                     magic, pkt_size = struct.unpack(HDR_FMT, hdr_buf)
 
-                    if magic == AUDIO_MAGIC and USE_USB:
+                    if magic == AUDIO_MAGIC and use_usb:
                         if pkt_size == 0 or pkt_size > MAX_AUDIO_PKT:
                             print(f"\n[USB invalid audio size={pkt_size}]", flush=True)
                             break
@@ -364,13 +363,13 @@ def main():
                         continue
 
                     if magic != STREAM_MAGIC or pkt_size == 0 or pkt_size > MAX_FRAME_SIZE:
-                        if USE_USB:
+                        if use_usb:
                             print(f"\n[USB sync lost: magic=0x{magic:08x}, size={pkt_size}]", flush=True)
                             break
                         continue
 
                     try:
-                        if USE_USB:
+                        if use_usb:
                             usb_dev.read_into_exact(frame_buf, pkt_size)
                         else:
                             recv_into_exact(sock, frame_view, pkt_size)
@@ -394,7 +393,7 @@ def main():
                     if elapsed >= 1.0:
                         fps = ok_frames / elapsed
                         mbps = (total_bytes * 8) / (elapsed * 1_000_000)
-                        tag = "USB" if USE_USB else "Wi-Fi"
+                        tag = "USB" if use_usb else "Wi-Fi"
                         print(f"PC Receiver ({tag}): {fps:.1f} FPS | Frame: {last_frame_size / 1024:.1f} KB | Bitrate: {mbps:.1f} Mbps", flush=True)
                         ok_frames = 0
                         total_bytes = 0
