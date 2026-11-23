@@ -41,7 +41,7 @@ static Result pluginCommand(u32 command_id, const void* input,
             .usb_fps_x100    = atomic_load(&ctx->usb_fps_x100),
             .audio_last_rc   = atomic_load(&ctx->audio_last_rc),
             .usb_last_rc     = atomic_load(&ctx->usb_last_rc),
-            .stream_port     = STREAM_PORT,
+            .stream_port     = ctx->video_port,
             .usb_state       = (u8)atomic_load(&ctx->usb_state),
             .usb_speed       = (u8)atomic_load(&ctx->usb_speed),
             .reserved        = 0,
@@ -53,7 +53,7 @@ static Result pluginCommand(u32 command_id, const void* input,
 
     if (command_id == 1) {
         *output_size = 0;
-        return capture_save_latest_frame(ctx, "sdmc:/kaihen_caps2s_frame.jpg");
+        return capture_save_latest_frame(ctx, "sdmc:/switch/SimpleStreamer/logs/test_capture.jpg");
     }
 
     if (command_id == 2) {
@@ -148,7 +148,8 @@ int main(void) {
     svcGetInfo(&core_mask, InfoType_CoreMask, CUR_PROCESS_HANDLE, 0);
 
     if (sd_mounted) {
-        FILE* f = fopen("sdmc:/kaihen_caps2s.log", "w");
+        stream_ensure_log_dir();
+        FILE* f = fopen(STREAM_LOG_PATH, "w");
         if (f) {
             fprintf(f, "stream-module started (fs=%d, sd=%d, sock_rc=0x%x, nifm=%d, core_mask=0x%lx)\n",
                     fs_inited, sd_mounted, sock_rc, nifm_inited, (unsigned long)core_mask);
@@ -156,9 +157,14 @@ int main(void) {
         }
     }
 
+    StreamConfig cfg;
+    stream_config_load(&cfg, sd_mounted);
+
     CaptureContext ctx = {0};
     ctx.listen_fd = -1;
     ctx.audio_listen_fd = -1;
+    ctx.video_port = cfg.video_port;
+    ctx.audio_port = cfg.audio_port;
     ctx.cap_idx   = 0;
     ctx.ready_idx = 1;
     ctx.net_idx   = 2;
@@ -167,13 +173,13 @@ int main(void) {
     condvarInit(&ctx.frame_cv);
     atomic_init(&ctx.stop_requested, false);
     atomic_init(&ctx.running, false);
-    atomic_init(&ctx.streaming_enabled, true);
+    atomic_init(&ctx.streaming_enabled, cfg.streaming_enabled);
     atomic_init(&ctx.client_connected, false);
     atomic_init(&ctx.net_listening, false);
-    atomic_init(&ctx.audio_enabled, true);
+    atomic_init(&ctx.audio_enabled, cfg.audio_enabled);
     atomic_init(&ctx.audio_listening, false);
     atomic_init(&ctx.audio_client_connected, false);
-    atomic_init(&ctx.usb_enabled, true);
+    atomic_init(&ctx.usb_enabled, cfg.usb_enabled);
     atomic_init(&ctx.usb_active, false);
     atomic_init(&ctx.usb_client_connected, false);
     atomic_init(&ctx.nifm_inited, nifm_inited);

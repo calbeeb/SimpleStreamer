@@ -56,7 +56,7 @@ Only tested on:
 Make sure you are successfully able to boot into kaiHen before attempting installation.
 
 1. Download `stream-conf.nro` and `stream-module.nso` from the latest release
-2. Copy `stream-conf.nro` to `sdmc:/switch`
+2. Copy `stream-conf.nro` to `sdmc:/switch/SimpleStreamer`
 3. Copy `stream-module.nso` to `sdmc:/kaihen/plugins`, creating the `plugins` folder if needed
     * If updating or replacing `stream-module.nso`, delete `sdmc:/kaihen/plugin-packages/stream-module.nsp`. You currently must reboot for changes to take effect
 
@@ -69,6 +69,25 @@ Download `stream-client.zip` from the latest release, and extract `cv2-client.py
 ### Switch 2 Usage
  
 With the correct files on the SD card, the stream should be available as soon as HEN launch is completed or the homebrew menu has been opened. Plugin status can be checked with `stream-conf.nro`
+
+#### Streamer Config
+
+`stream-module.nso` ships with all features enabled and default values for video & audio stream ports, but these can be edited at `sdmc:/switch/SimpleStreamer/capture.cfg`. 
+If the file does not exist it will be created on first load, and any changes require a restart to apply.
+If any issues are found the default values will be used and the problematic line will be logged in `sdmc:/switch/SimpleStreamer/logs/streamer.log`
+The default `sdmc:/switch/SimpleStreamer/capture.cfg` is as seen below:
+
+```
+# SimpleStreamer boot configuration
+# Booleans accept: true, false, 1, 0
+# Ports accept: 1-65535 (video_port and audio_port must differ)
+# Delete this file to regenerate defaults.
+streaming_enabled = true
+audio_enabled = true
+usb_enabled = true
+video_port = 8080
+audio_port = 8081
+```
 
 ### Client Usage
 For GUI interface usage on Windows:

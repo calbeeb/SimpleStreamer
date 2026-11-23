@@ -69,7 +69,7 @@ int main(int argc, char* argv[]) {
         if ((kDown & HidNpadButton_A) && connected) {
             Result saveRc = serviceDispatch(&pluginSrv, 1);
             if (R_SUCCEEDED(saveRc)) {
-                snprintf(statusMsg, sizeof(statusMsg), "Saved sdmc:/kaihen_caps2s_frame.jpg!");
+                snprintf(statusMsg, sizeof(statusMsg), "Saved sdmc:/switch/SimpleStreamer/logs/test_capture.jpg");
             } else {
                 snprintf(statusMsg, sizeof(statusMsg), "Save failed: 0x%x", saveRc);
             }
@@ -138,7 +138,7 @@ int main(int argc, char* argv[]) {
 
         // Render UI
         consoleClear();
-        printf("=== Switch 2 Live MJPEG Streamer ===\n\n");
+        printf("=== SimpleStreamer Config & Status ===\n\n");
         printf("Plugin IPC:  %s (open_rc: 0x%x)\n", connected ? "CONNECTED" : "DISCONNECTED", openRc);
 
         if (connected) {
@@ -178,19 +178,21 @@ int main(int argc, char* argv[]) {
                    usb_speed_name(st.usb_speed),
                    usb_conn ? "CONNECTED" : "WAITING",
                    st.usb_last_rc);
-            printf("\nWi-Fi CMD:   python cv2-client.py %s\n", ipStr);
-            printf("USB CMD:     python cv2-client.py --usb\n");
+            printf("\nWi-Fi CMD:   python cv2_client.py %s\n", ipStr);
+            printf("             python ffplay-client.py %s\n", ipStr);
+            printf("USB CMD:     python cv2_client.py --usb\n");
+            printf("             python ffplay-client.py --usb\n");
             printf("Stream:      %s\n", stream_en ? "ENABLED" : "PAUSED");
         }
 
         printf("\n---------------------------------------\n");
         printf("Last Action: %s\n", statusMsg);
         printf("---------------------------------------\n\n");
-        printf("[A] Save Frame to SD (sdmc:/kaihen_caps2s_frame.jpg)\n");
-        printf("[B] Toggle Streaming ON/OFF\n");
-        printf("[L] Toggle USB Mode ON/OFF (disable for Album USB copy)\n");
-        printf("[R] Toggle Audio ON/OFF\n");
-        printf("[X] Stop Background Plugin\n");
+        printf("[A] Save Frame to SD (sdmc:/switch/SimpleStreamer/logs/test_capture.jpg)\n");
+        printf("[B] Toggle Stream\n");
+        printf("[L] Toggle USB Stream (disable for Album USB copy)\n");
+        printf("[R] Toggle Audio Stream\n");
+        printf("[X] Stop Background Plugin (cannot reboot without reloading kaiHEN)\n");
         printf("[Y] Reconnect to Plugin\n");
         printf("[+] Exit Config (keeps background stream running)\n");
 

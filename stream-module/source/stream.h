@@ -15,6 +15,10 @@
 #define STREAM_PORT            8080
 #define AUDIO_STREAM_PORT      8081
 
+#define STREAM_LOG_DIR         "sdmc:/switch/SimpleStreamer/logs"
+#define STREAM_LOG_PATH        STREAM_LOG_DIR "/streamer.log"
+#define STREAM_CFG_PATH        "sdmc:/switch/SimpleStreamer/streamer.cfg"
+
 #define STREAM_MAGIC           0x5357324Au // "SW2J"
 #define AUDIO_STREAM_MAGIC     0x53573241u // "SW2A"
 
@@ -70,6 +74,14 @@ typedef struct {
 } AudioCaptureSession;
 
 typedef struct {
+    bool streaming_enabled;
+    bool audio_enabled;
+    bool usb_enabled;
+    u16  video_port;
+    u16  audio_port;
+} StreamConfig;
+
+typedef struct {
     Handle exit_write;
     Mutex buf_mutex;
     CondVar frame_cv;
@@ -86,6 +98,8 @@ typedef struct {
     u64 usb_last_seq;
     int listen_fd;
     int audio_listen_fd;
+    u16 video_port;
+    u16 audio_port;
     atomic_bool stop_requested;
     atomic_bool running;
     atomic_bool streaming_enabled;
@@ -112,7 +126,10 @@ typedef struct {
     atomic_uint_fast64_t last_frame_size;
 } CaptureContext;
 
+void stream_ensure_log_dir(void);
 void stream_write_log(const char* msg);
+void stream_config_defaults(StreamConfig* cfg);
+void stream_config_load(StreamConfig* cfg, bool sd_mounted);
 void capture_thread_func(void* arg);
 Result capture_save_latest_frame(CaptureContext* ctx, const char* path);
 void network_thread_func(void* arg);

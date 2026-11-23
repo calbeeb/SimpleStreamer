@@ -445,12 +445,16 @@ void audio_thread_func(void* arg) {
             }
 
             if (server_fd < 0 && cur_ip != 0) {
-                server_fd = audio_create_tcp_listener(AUDIO_STREAM_PORT);
+                server_fd = audio_create_tcp_listener(ctx->audio_port);
                 if (server_fd >= 0) {
                     ctx->audio_listen_fd = server_fd;
                     bound_ip = cur_ip;
                     atomic_store(&ctx->audio_listening, true);
-                    stream_write_log("Audio TCP PCM streamer listening on port 8081 (48kHz 16-bit stereo).");
+                    char listen_msg[112];
+                    snprintf(listen_msg, sizeof(listen_msg),
+                             "Audio TCP PCM streamer listening on port %u (48kHz 16-bit stereo).",
+                             (unsigned)ctx->audio_port);
+                    stream_write_log(listen_msg);
                 } else {
                     svcSleepThread(500000000ULL);
                     continue;
@@ -511,7 +515,11 @@ void audio_thread_func(void* arg) {
         }
 
         atomic_store(&ctx->audio_client_connected, true);
-        stream_write_log("Audio client connected via TCP (port 8081).");
+        char conn_msg[96];
+        snprintf(conn_msg, sizeof(conn_msg),
+                 "Audio client connected via TCP (port %u).",
+                 (unsigned)ctx->audio_port);
+        stream_write_log(conn_msg);
 
         u8* pcm_ring = sess.ring_base + 0x10C0;
         bool client_ok = true;

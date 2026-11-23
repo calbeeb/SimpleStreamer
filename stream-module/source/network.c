@@ -149,12 +149,16 @@ void network_thread_func(void* arg) {
             }
 
             if (server_fd < 0 && cur_ip != 0) {
-                server_fd = create_tcp_listener(STREAM_PORT, "TCP");
+                server_fd = create_tcp_listener(ctx->video_port, "TCP");
                 if (server_fd >= 0) {
                     ctx->listen_fd = server_fd;
                     bound_ip = cur_ip;
                     atomic_store(&ctx->net_listening, true);
-                    stream_write_log("TCP low-latency JPEG streamer listening on port 8080.");
+                    char listen_msg[96];
+                    snprintf(listen_msg, sizeof(listen_msg),
+                             "TCP low-latency JPEG streamer listening on port %u.",
+                             (unsigned)ctx->video_port);
+                    stream_write_log(listen_msg);
                 } else {
                     svcSleepThread(500000000ULL);
                     continue;

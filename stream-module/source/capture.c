@@ -5,7 +5,7 @@
 #include "stream.h"
 
 void stream_write_log(const char* msg) {
-    FILE* f = fopen("sdmc:/kaihen_caps2s.log", "a");
+    FILE* f = fopen(STREAM_LOG_PATH, "a");
     if (f) {
         fprintf(f, "%s\n", msg);
         fclose(f);
