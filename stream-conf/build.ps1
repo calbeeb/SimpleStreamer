@@ -16,6 +16,11 @@ $env:DEVKITPRO = $devkitpro
 $prefix = "$devkitpro/devkitA64/bin/aarch64-none-elf-"
 $gcc = "${prefix}gcc.exe"
 $elf2nro = "$devkitpro/tools/bin/elf2nro.exe"
+$nacptool = "$devkitpro/tools/bin/nacptool.exe"
+
+$appVersion = "0.4.0"
+$appTitle   = "SimpleStreamer"
+$appAuthor  = "calbeeb"
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $scriptDir
@@ -74,8 +79,15 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 
+Write-Host "Creating build/stream-conf.nacp..."
+& $nacptool --create $appTitle $appAuthor $appVersion "build/stream-conf.nacp"
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "nacptool failed."
+    exit 1
+}
+
 Write-Host "Creating stream-conf.nro..."
-& $elf2nro "build/stream-conf.elf" "stream-conf.nro"
+& $elf2nro "build/stream-conf.elf" "stream-conf.nro" "--nacp=build/stream-conf.nacp"
 if ($LASTEXITCODE -ne 0) {
     Write-Error "elf2nro failed."
     exit 1
