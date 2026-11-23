@@ -1,7 +1,7 @@
 # SimpleStreamer
 
 ## About
-### Requires a stable & strong network connection, bitrates can exceed *250* Mbps
+### Requires USB 2.0 connectivity or a stable & strong network, bitrates can exceed 250 Mbps
 
 This repo is a proof of concept for display streaming from a jailbroken Switch 2 to another device. It uses the `caps2:s` service to create a 1080p MJPEG stream targeting 30fps, alongside `auddmg:u` and `audsmx:u` for 48kHz 16-bit stereo audio, and streams both to a client over TCP or USB. It does not reach the 30fps target and it is unlikely it will in the near future.
 
